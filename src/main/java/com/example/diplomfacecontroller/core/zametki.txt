@@ -1,0 +1,20 @@
+Camera →
+Face landmarks →
+ГЕОМЕТРИЯ (основной gaze) →
+CNN (уточнение) →
+EMA фильтр →
+Калибровка →
+Cursor
+
+FaceProcessor
+        ↓
+GeometricGazeEstimator   ← основной
+        ↓
+NeuralRefinement (CNN)   ← дополнительный
+        ↓
+EMAFilter
+        ↓
+CalibrationManager
+        ↓
+MouseController
+
