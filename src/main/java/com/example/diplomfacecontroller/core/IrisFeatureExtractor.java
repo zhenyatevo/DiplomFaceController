@@ -11,7 +11,7 @@ public class IrisFeatureExtractor {
     // Левый глаз: верхнее веко=159, нижнее=145, левый угол=33, правый угол=133
     // Правый глаз: верхнее веко=386, нижнее=374, левый угол=362, правый угол=263
     private static final int L_TOP = 159, L_BOT = 145, L_LEFT = 33,  L_RIGHT = 133;
-    private static final int R_TOP = 386, R_BOT = 374, R_LEFT = 362, R_RIGHT = 263;
+    private static final int R_TOP = 386, R_BOT = 374, R_LEFT = 263, R_RIGHT = 362;
 
     /**
      * Извлекает 6 признаков из массива landmarks.

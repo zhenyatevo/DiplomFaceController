@@ -101,6 +101,17 @@ public class MainController implements Initializable {
 
         logger.info("MainController initialized successfully");
         logger.info("Using cameras - Face ID: {}, Eye ID: {}", faceCameraId, eyeCameraId);
+        // Глобальный стоп по Ctrl+Shift+Q
+        Platform.runLater(() -> {
+            rootPane.getScene().setOnKeyPressed(event -> {
+                if (event.isControlDown() && event.isShiftDown() &&
+                        event.getCode().toString().equals("Q")) {
+                    stopTracking();
+                    mouseController.setEnabled(false);
+                    logger.info("EMERGENCY STOP");
+                }
+            });
+        });
     }
 
     private void setupImageViews() {

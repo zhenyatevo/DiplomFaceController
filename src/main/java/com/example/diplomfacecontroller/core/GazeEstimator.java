@@ -50,6 +50,22 @@ public class GazeEstimator {
     private CalibrationParameters          calibrationParams;
     private QuadraticCalibrationParameters quadParams;
     private boolean useQuadratic = false;
+    private final double[] histX = new double[5];
+    private final double[] histY = new double[5];
+    private int histIdx = 0;
+
+    // Добавь метод:
+    private Point2D medianFilter(double x, double y) {
+        histX[histIdx] = x;
+        histY[histIdx] = y;
+        histIdx = (histIdx + 1) % histX.length;
+
+        double[] sx = histX.clone();
+        double[] sy = histY.clone();
+        java.util.Arrays.sort(sx);
+        java.util.Arrays.sort(sy);
+        return new Point2D(sx[sx.length / 2], sy[sy.length / 2]);
+    }
 
     public GazeEstimator() {
         this.rawGaze          = new Point2D(0, 0);
@@ -152,45 +168,57 @@ public class GazeEstimator {
 
         float[] landmarks = mediaPipeBridge.processFrame(frame);
         if (landmarks == null) {
-            // Лицо не найдено — возвращаем последние данные без изменений
             return lastGazeData;
         }
 
         float[] iris = irisExtractor.extract(landmarks);
-        // iris[0],[1] = левый зрачок  X,Y  (диапазон 0..1)
-        // iris[2],[3] = правый зрачок X,Y  (диапазон 0..1)
-        // iris[4]     = EAR левый
-        // iris[5]     = EAR правый
 
-        // Переводим из [0,1] в [-1,1]
-        double gazeX = ((iris[0] + iris[2]) / 2.0) * 2.0 - 1.0;
-        double gazeY = ((iris[1] + iris[3]) / 2.0) * 2.0 - 1.0;
+        // Среднее между двумя зрачками
+        double rawX = (iris[0] + iris[2]) / 2.0;
+        double rawY = (iris[1] + iris[3]) / 2.0;
 
-        this.rawGaze = smooth(new Point2D(gazeX, gazeY));
+        // СТАЛО — с индивидуальными диапазонами для X и Y:
+// По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
+// По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
+        double centerX = 0.58;
+        double centerY = 0.44;
+        double rangeX  = 0.10;  // половина диапазона X
+        double rangeY  = 0.045; // половина диапазона Y (меньше, т.к. глаза мало двигаются вертикально)
+
+        double gazeX = (rawX - centerX) / rangeX;
+        double gazeY = (rawY - centerY) / rangeY;
+
+        // Ограничение диапазона
+        gazeX = Math.max(-1, Math.min(1, gazeX));
+        gazeY = Math.max(-1, Math.min(1, gazeY));
+
+        // Сглаживание
+        Point2D filtered = medianFilter(gazeX, gazeY);
+        this.rawGaze = smooth(filtered);
 
         gd.setLeftEyeGaze(new Point2D(iris[0] * 2 - 1, iris[1] * 2 - 1));
         gd.setRightEyeGaze(new Point2D(iris[2] * 2 - 1, iris[3] * 2 - 1));
         gd.setCombinedGaze(rawGaze);
 
-        // Моргание через EAR
-        boolean leftClosed  = iris[4] < 0.20f;
-        boolean rightClosed = iris[5] < 0.20f;
+        boolean leftClosed  = iris[4] < 0.18f;
+        boolean rightClosed = iris[5] < 0.18f;
         gd.setLeftEyeClosed(leftClosed);
         gd.setRightEyeClosed(rightClosed);
 
         if (leftClosed && rightClosed) {
             long now = System.currentTimeMillis();
-            if (now - lastBlinkTime > 100) {
+            if (now - lastBlinkTime > 150) {
                 blinkCount++;
                 gd.setLastBlinkTime(now);
                 lastBlinkTime = now;
-                logger.debug("Blink detected via EAR! Total: {}", blinkCount);
             }
         }
 
         if (frameCount % 30 == 0) {
-            logger.info("[Neural] gaze=({:.2f},{:.2f}) EAR L={:.2f} R={:.2f}",
-                    gazeX, gazeY, iris[4], iris[5]);
+            logger.info("[Neural] rawX={} rawY={} gazeX={} gazeY={} EAR L={} R={}",
+                    String.format("%.3f", rawX), String.format("%.3f", rawY),
+                    String.format("%.3f", gazeX), String.format("%.3f", gazeY),
+                    String.format("%.2f", iris[4]), String.format("%.2f", iris[5]));
         }
 
         this.lastGazeData = gd;
@@ -362,7 +390,7 @@ public class GazeEstimator {
         double dx    = Math.abs(raw.getX() - prevX);
         double dy    = Math.abs(raw.getY() - prevY);
         double speed = Math.sqrt(dx * dx + dy * dy);
-        double alpha = Math.min(0.6, Math.max(0.1, 0.3 / (speed + 0.1)));
+        double alpha = Math.min(0.4, Math.max(0.05, 0.15 / (speed + 0.1)));
         double sx    = prevX + alpha * (raw.getX() - prevX);
         double sy    = prevY + alpha * (raw.getY() - prevY);
         prevX = sx; prevY = sy;

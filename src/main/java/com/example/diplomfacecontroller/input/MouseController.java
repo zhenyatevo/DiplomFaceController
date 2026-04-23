@@ -23,12 +23,9 @@ public class MouseController {
     private double smoothX;
     private double smoothY;
 
-    // Параметры (подобраны для gaze)
-    private double smoothingFactor = 0.35;
+    private double smoothingFactor = 0.6;   // больше = плавнее, но медленнее
     private double sensitivity = 1.0;
-
-    // ВАЖНО — увеличена мёртвая зона
-    private double deadZoneRadius = 0.08;
+    private double deadZoneRadius = 0.04;   // меньше мёртвая зона
 
     // Клики
     private long lastBlinkTime = 0;
@@ -96,6 +93,11 @@ public class MouseController {
         smoothX = smoothX * smoothingFactor + targetX * (1 - smoothingFactor);
 
         smoothY = smoothY * smoothingFactor + targetY * (1 - smoothingFactor);
+        // ДОБАВИТЬ: не двигаем мышь если смещение меньше 3 пикселей
+        Point currentPos = MouseInfo.getPointerInfo().getLocation();
+        if (Math.abs(smoothX - currentPos.x) < 3 && Math.abs(smoothY - currentPos.y) < 3) {
+            return;
+        }
 
         // Чувствительность
         double finalX = smoothX * sensitivity;
