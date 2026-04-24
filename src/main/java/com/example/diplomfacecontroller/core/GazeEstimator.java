@@ -54,6 +54,11 @@ public class GazeEstimator {
     private final double[] histY = new double[5];
     private int histIdx = 0;
 
+    // ===== Допустимый диапазон калиброванного gaze =====
+    // РАСШИРЕНО с ±1.2 до ±1.5 — чтобы MouseController мог применить edgeGain
+    // и реально докрутить курсор до краёв экрана.
+    private static final double CALIB_CLAMP = 1.5;
+
     // Добавь метод:
     private Point2D medianFilter(double x, double y) {
         histX[histIdx] = x;
@@ -177,20 +182,28 @@ public class GazeEstimator {
         double rawX = (iris[0] + iris[2]) / 2.0;
         double rawY = (iris[1] + iris[3]) / 2.0;
 
-        // СТАЛО — с индивидуальными диапазонами для X и Y:
-// По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
-// По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
+        // ===== РАСШИРЕННЫЕ ДИАПАЗОНЫ =====
+        // ВАЖНО: если в твоих логах видно, что rawX реально ходит от 0.46 до 0.70,
+        // настрой centerX = (max+min)/2 = 0.58, rangeX = (max-min)/2 = 0.12.
+        // Старые значения (0.10, 0.045) были слишком УЗКИМИ — нормированный gazeX
+        // выходил за ±1 при обычных поворотах глаза и обрезался, из-за чего
+        // калибровка не могла вытянуть края.
+        //
+        // Теперь даём больше запаса, чтобы даже при экстремальном взгляде
+        // нормированное значение было около ±1, а не прибивалось к клампу.
         double centerX = 0.58;
         double centerY = 0.44;
-        double rangeX  = 0.10;  // половина диапазона X
-        double rangeY  = 0.045; // половина диапазона Y (меньше, т.к. глаза мало двигаются вертикально)
+        double rangeX  = 0.13;   // было 0.10 — расширено
+        double rangeY  = 0.065;  // было 0.045 — расширено
 
         double gazeX = (rawX - centerX) / rangeX;
         double gazeY = (rawY - centerY) / rangeY;
 
-        // Ограничение диапазона
-        gazeX = Math.max(-1, Math.min(1, gazeX));
-        gazeY = Math.max(-1, Math.min(1, gazeY));
+        // ===== НЕ КЛАМПИМ ЖЁСТКО ДО КАЛИБРОВКИ =====
+        // Мягкое ограничение, чтобы выбросы не ломали медианный фильтр,
+        // но диапазон шире ±1, чтобы калибровка могла учесть крайние точки.
+        gazeX = Math.max(-1.5, Math.min(1.5, gazeX));
+        gazeY = Math.max(-1.5, Math.min(1.5, gazeY));
 
         // Сглаживание
         Point2D filtered = medianFilter(gazeX, gazeY);
@@ -215,7 +228,7 @@ public class GazeEstimator {
         }
 
         if (frameCount % 30 == 0) {
-            logger.info("[Neural] rawX={} rawY={} gazeX={} gazeY={} EAR L={} R={}",
+            logger.info("[Neural] rawIris=({},{}) gaze=({},{}) EAR L={} R={}",
                     String.format("%.3f", rawX), String.format("%.3f", rawY),
                     String.format("%.3f", gazeX), String.format("%.3f", gazeY),
                     String.format("%.2f", iris[4]), String.format("%.2f", iris[5]));
@@ -226,64 +239,48 @@ public class GazeEstimator {
     }
 
     // ================================================================
-    //  HAAR-АНАЛИЗ (оригинальный код, без изменений)
+    //  HAAR АНАЛИЗ (fallback)
     // ================================================================
 
-    private GazeData analyzeGazeHaar(Mat eyeFrame) {
-        GazeData gazeData = new GazeData();
+    private GazeData analyzeGazeHaar(Mat frame) {
         frameCount++;
+        GazeData gazeData = new GazeData();
 
-        if (eyeFrame == null || eyeFrame.empty()) {
-            this.lastGazeData = gazeData;
-            return gazeData;
-        }
-        if (!detectorLoaded) {
+        if (!detectorLoaded || frame == null || frame.empty()) {
+            this.rawGaze = new Point2D(0, 0);
+            gazeData.setCombinedGaze(new Point2D(0, 0));
             this.lastGazeData = gazeData;
             return gazeData;
         }
 
         try {
             Mat gray = new Mat();
-            Imgproc.cvtColor(eyeFrame, gray, Imgproc.COLOR_BGR2GRAY);
+            Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
+            Imgproc.equalizeHist(gray, gray);
 
-            MatOfRect eyes = new MatOfRect();
-            eyeDetector.detectMultiScale(gray, eyes);
-            Rect[] eyesArray = eyes.toArray();
-
-            if (eyesArray.length > 0) eyesFoundCount++;
-            else                      eyesNotFoundCount++;
-
-            if (frameCount % 30 == 0) {
-                logger.info("[Haar] Frame {}: {} eyes found / {} not found",
-                        frameCount, eyesFoundCount, eyesNotFoundCount);
-            }
+            MatOfRect eyesRect = new MatOfRect();
+            eyeDetector.detectMultiScale(gray, eyesRect,
+                    1.1, 4, 0, new Size(20, 20), new Size());
+            Rect[] eyesArray = eyesRect.toArray();
 
             if (eyesArray.length == 0) {
+                eyesNotFoundCount++;
                 this.rawGaze = new Point2D(0, 0);
                 gazeData.setCombinedGaze(new Point2D(0, 0));
                 this.lastGazeData = gazeData;
                 return gazeData;
             }
+            eyesFoundCount++;
 
-            for (int i = 0; i < eyesArray.length; i++) {
+            for (int i = 0; i < Math.min(eyesArray.length, 2); i++) {
                 Rect eye = eyesArray[i];
-                Imgproc.rectangle(eyeFrame, eye, new Scalar(0, 255, 0), 1);
+                Mat eyeROI = gray.submat(eye);
+                Point pupil = findPupilCenter(eyeROI);
 
-                Mat eyeROI   = new Mat(gray, eye);
-                Mat equalized = new Mat();
-                Imgproc.equalizeHist(eyeROI, equalized);
-
-                Point pupilPos = findPupilCenter(equalized);
-                Imgproc.circle(eyeFrame,
-                        new Point(eye.x + pupilPos.x, eye.y + pupilPos.y),
-                        3, new Scalar(0, 0, 255), -1);
-
-                double normX    = pupilPos.x / eye.width;
-                double normY    = pupilPos.y / eye.height;
-                double rawGazeX = Math.max(-1, Math.min(1, normX * 2 - 1));
-                double rawGazeY = Math.max(-1, Math.min(1, normY * 2 - 1));
-
+                double rawGazeX = (pupil.x - eye.width / 2.0) / (eye.width / 2.0);
+                double rawGazeY = (pupil.y - eye.height / 2.0) / (eye.height / 2.0);
                 double finalX = rawGazeX, finalY = rawGazeY;
+
                 if (i == 0) {
                     if (Math.abs(rawGazeX - prevLeftX) > MAX_GAZE_STEP ||
                             Math.abs(rawGazeY - prevLeftY) > MAX_GAZE_STEP) {
@@ -383,7 +380,7 @@ public class GazeEstimator {
     }
 
     // ================================================================
-    //  СГЛАЖИВАНИЕ И КАЛИБРОВКА — без изменений
+    //  СГЛАЖИВАНИЕ И КАЛИБРОВКА
     // ================================================================
 
     private Point2D smooth(Point2D raw) {
@@ -409,9 +406,10 @@ public class GazeEstimator {
             cx = calibrationParams.applyX(rx);
             cy = calibrationParams.applyY(ry);
         }
+        // РАСШИРЕНО до ±1.5 — чтобы MouseController.edgeGain мог вытянуть до края экрана.
         return new Point2D(
-                Math.max(-1.2, Math.min(1.2, cx)),
-                Math.max(-1.2, Math.min(1.2, cy))
+                Math.max(-CALIB_CLAMP, Math.min(CALIB_CLAMP, cx)),
+                Math.max(-CALIB_CLAMP, Math.min(CALIB_CLAMP, cy))
         );
     }
 

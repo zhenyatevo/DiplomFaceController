@@ -23,9 +23,30 @@ public class MouseController {
     private double smoothX;
     private double smoothY;
 
-    private double smoothingFactor = 0.6;   // больше = плавнее, но медленнее
+    private double smoothingFactor = 0.55;   // больше = плавнее, но медленнее
     private double sensitivity = 1.0;
     private double deadZoneRadius = 0.04;   // меньше мёртвая зона
+
+    // ===== НОВЫЕ ПАРАМЕТРЫ =====
+    /**
+     * Коэффициент усиления входного gaze. Значение > 1.0 позволяет
+     * достигать краёв экрана даже если откалиброванный gaze не доходит
+     * до ±1. Например, 1.25 = активная зона экрана начинается с |gaze| = 0.8.
+     */
+    private double edgeGain = 1.25;
+
+    /**
+     * Расстояние от края экрана (в пикселях), в пределах которого
+     * курсор "приклеивается" к краю, чтобы гарантированно достичь его
+     * несмотря на EMA-сглаживание.
+     */
+    private static final int EDGE_SNAP_PX = 15;
+
+    /**
+     * Минимальные отступы от края экрана (0 = курсор может быть в самом углу).
+     * На Windows иногда нужно 1px чтобы курсор не "проваливался" за экран.
+     */
+    private static final int EDGE_MARGIN_PX = 0;
 
     // Клики
     private long lastBlinkTime = 0;
@@ -64,47 +85,78 @@ public class MouseController {
         double gazeX = calibratedGaze.getX();
         double gazeY = calibratedGaze.getY();
 
-        // Проверка диапазона
-        if (Math.abs(gazeX) > 1.2 || Math.abs(gazeY) > 1.2) {
-
+        // Защита от совсем диких выбросов (gaze приходит уже с ограничением ±1.2 из GazeEstimator,
+        // но оставим sanity-check на случай NaN/Infinity)
+        if (Double.isNaN(gazeX) || Double.isNaN(gazeY) ||
+                Math.abs(gazeX) > 3.0 || Math.abs(gazeY) > 3.0) {
             return;
         }
 
-        // Ограничиваем диапазон
-        gazeX = Math.max(-1, Math.min(1, gazeX));
-        gazeY = Math.max(-1, Math.min(1, gazeY));
+        // ===== УСИЛЕНИЕ ПО КРАЯМ =====
+        // Умножаем gaze на edgeGain, чтобы края достигались раньше (при gaze ≈ ±0.8).
+        // Затем жёстко ограничиваем в ±1, чтобы клампинг произошёл ПОСЛЕ усиления.
+        gazeX *= edgeGain;
+        gazeY *= edgeGain;
 
-        // Мёртвая зона
+        gazeX = Math.max(-1.0, Math.min(1.0, gazeX));
+        gazeY = Math.max(-1.0, Math.min(1.0, gazeY));
+
+        // Мёртвая зона (считаем от центра, до усиления bigger не делала бы влияния —
+        // делаем проверку уже на усиленном, но эффект небольшой)
         if (isInDeadZone(gazeX, gazeY)) {
             return;
         }
 
         // Перевод gaze → экран
-        double targetX = (gazeX + 1) / 2 * screenSize.width;
+        double targetX = (gazeX + 1) / 2.0 * screenSize.width;
+        double targetY = (gazeY + 1) / 2.0 * screenSize.height;
 
-        double targetY = (gazeY + 1) / 2 * screenSize.height;
+        // Ограничение краёв (минимальное, чтобы курсор мог быть в самом углу)
+        targetX = Math.max(EDGE_MARGIN_PX, Math.min(screenSize.width  - 1 - EDGE_MARGIN_PX, targetX));
+        targetY = Math.max(EDGE_MARGIN_PX, Math.min(screenSize.height - 1 - EDGE_MARGIN_PX, targetY));
 
-        // Ограничение краёв
-        targetX = Math.max(5, Math.min(screenSize.width - 5, targetX));
+        // Чувствительность применяем до сглаживания — смещаем вокруг центра экрана
+        double cx = screenSize.width  / 2.0;
+        double cy = screenSize.height / 2.0;
+        targetX = cx + (targetX - cx) * sensitivity;
+        targetY = cy + (targetY - cy) * sensitivity;
 
-        targetY = Math.max(5, Math.min(screenSize.height - 5, targetY));
+        // Снова ограничиваем после sensitivity
+        targetX = Math.max(EDGE_MARGIN_PX, Math.min(screenSize.width  - 1 - EDGE_MARGIN_PX, targetX));
+        targetY = Math.max(EDGE_MARGIN_PX, Math.min(screenSize.height - 1 - EDGE_MARGIN_PX, targetY));
 
         // Сглаживание EMA
         smoothX = smoothX * smoothingFactor + targetX * (1 - smoothingFactor);
-
         smoothY = smoothY * smoothingFactor + targetY * (1 - smoothingFactor);
-        // ДОБАВИТЬ: не двигаем мышь если смещение меньше 3 пикселей
+
+        // ===== SNAP К КРАЮ =====
+        // EMA никогда не достигает край асимптотически. Если цель уже у края — пристёгиваем.
+        double finalX = smoothX;
+        double finalY = smoothY;
+
+        if (targetX <= EDGE_SNAP_PX) {
+            finalX = EDGE_MARGIN_PX;
+            smoothX = finalX; // чтобы EMA не тянул обратно
+        } else if (targetX >= screenSize.width - 1 - EDGE_SNAP_PX) {
+            finalX = screenSize.width - 1 - EDGE_MARGIN_PX;
+            smoothX = finalX;
+        }
+
+        if (targetY <= EDGE_SNAP_PX) {
+            finalY = EDGE_MARGIN_PX;
+            smoothY = finalY;
+        } else if (targetY >= screenSize.height - 1 - EDGE_SNAP_PX) {
+            finalY = screenSize.height - 1 - EDGE_MARGIN_PX;
+            smoothY = finalY;
+        }
+
+        // Не двигаем мышь если смещение меньше 2 пикселей (снижаем дрожание)
         Point currentPos = MouseInfo.getPointerInfo().getLocation();
-        if (Math.abs(smoothX - currentPos.x) < 3 && Math.abs(smoothY - currentPos.y) < 3) {
+        if (Math.abs(finalX - currentPos.x) < 2 && Math.abs(finalY - currentPos.y) < 2) {
             return;
         }
 
-        // Чувствительность
-        double finalX = smoothX * sensitivity;
-
-        double finalY = smoothY * sensitivity;
-
-        robot.mouseMove((int) finalX, (int) finalY);
+        robot.mouseMove((int) Math.round(finalX), (int) Math.round(finalY));
 
         // Обработка морганий
         if (gazeData != null) {
@@ -113,7 +165,7 @@ public class MouseController {
     }
 
     /**
-     * Проверка мёртвой зоны
+     * Проверка мёртвой зоны (относительно gazeX, gazeY в диапазоне [-1, 1])
      */
     private boolean isInDeadZone(double gazeX, double gazeY) {
 
@@ -263,5 +315,20 @@ public class MouseController {
     public void setDeadZoneRadius(double deadZoneRadius) {
 
         this.deadZoneRadius = Math.max(0.02, Math.min(0.15, deadZoneRadius));
+    }
+
+    /**
+     * НОВОЕ: усиление gaze для достижения краёв.
+     * 1.0 = без усиления (может не доходить до края)
+     * 1.25 = по умолчанию (края достигаются при |gaze| ≈ 0.8)
+     * 1.5  = агрессивно (края при |gaze| ≈ 0.67)
+     */
+    public void setEdgeGain(double edgeGain) {
+        this.edgeGain = Math.max(1.0, Math.min(2.0, edgeGain));
+        logger.info("Edge gain set to {}", this.edgeGain);
+    }
+
+    public double getEdgeGain() {
+        return edgeGain;
     }
 }
