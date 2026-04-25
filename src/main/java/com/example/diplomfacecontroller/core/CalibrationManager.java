@@ -2,9 +2,11 @@ package com.example.diplomfacecontroller.core;
 
 import com.example.diplomfacecontroller.input.MouseController;
 import javafx.animation.*;
+import javafx.application.Platform;
 import javafx.geometry.Point2D;
 import javafx.geometry.Rectangle2D;
 import javafx.scene.Scene;
+import javafx.scene.control.Alert;
 import javafx.scene.layout.Pane;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Circle;
@@ -19,8 +21,13 @@ import java.util.stream.Collectors;
 public class CalibrationManager {
 
     private static final Logger logger = LoggerFactory.getLogger(CalibrationManager.class);
-    private static final int POINT_DURATION_SEC = 4;          // сбор на точку 4 секунды
-    private static final long IGNORE_FIRST_NS = 800_000_000L; // игнорировать первые 0.8 сек
+
+    private static final int POINT_DURATION_SEC = 5;
+    private static final long IGNORE_FIRST_NS = 1_200_000_000L;
+
+    /** Минимальный требуемый разброс raw-координат между точками калибровки.
+     *  Если разброс меньше — калибровка не имеет смысла (взгляд почти не двигался). */
+    private static final double MIN_RAW_SPREAD = 0.3;
 
     private final GazeEstimator gazeEstimator;
     private final MouseController mouseController;
@@ -86,7 +93,6 @@ public class CalibrationManager {
         Pane root = (Pane) calibrationStage.getScene().getRoot();
         root.getChildren().add(point);
 
-        // Анимация пульсации
         ScaleTransition pulse = new ScaleTransition(Duration.seconds(0.6), point);
         pulse.setFromX(1); pulse.setToX(1.4);
         pulse.setFromY(1); pulse.setToY(1.4);
@@ -107,10 +113,9 @@ public class CalibrationManager {
                     lastSample = now;
                     return;
                 }
-                // Пропускаем первые IGNORE_FIRST_NS наносекунд
                 if (now - startTime < IGNORE_FIRST_NS) return;
 
-                if (now - lastSample >= 70_000_000) { // ~14 Гц
+                if (now - lastSample >= 70_000_000) {
                     Point2D raw = gazeEstimator.getRawGaze();
                     if (raw != null) rawSamples.add(raw);
                     lastSample = now;
@@ -126,11 +131,12 @@ public class CalibrationManager {
             root.getChildren().remove(point);
 
             if (!rawSamples.isEmpty()) {
-                // Используем медиану вместо среднего
-                Point2D median = medianFiltered(rawSamples);
-                samples.add(new CalibrationSample(median.getX(), median.getY(), screenX, screenY));
-                logger.info("Point {} done, raw samples={}, median=({}, {})",
-                        index, rawSamples.size(), median.getX(), median.getY());
+                Point2D trimmedMedian = trimmedMedianFiltered(rawSamples, 0.2);
+                samples.add(new CalibrationSample(trimmedMedian.getX(), trimmedMedian.getY(), screenX, screenY));
+                logger.info("Point {} done, raw samples={}, trimmed-median=({}, {})",
+                        index, rawSamples.size(),
+                        String.format("%.3f", trimmedMedian.getX()),
+                        String.format("%.3f", trimmedMedian.getY()));
             } else {
                 logger.warn("No samples collected for point {}", index);
             }
@@ -139,38 +145,103 @@ public class CalibrationManager {
         pause.play();
     }
 
-    /** Медианная фильтрация (устойчива к выбросам) */
-    private Point2D medianFiltered(List<Point2D> samples) {
+    /** Trimmed median — отбрасываем верхние/нижние `trim` % значений, потом медиана. */
+    private Point2D trimmedMedianFiltered(List<Point2D> samples, double trim) {
         if (samples.isEmpty()) return new Point2D(0, 0);
+
         List<Double> xs = samples.stream().map(Point2D::getX).sorted().collect(Collectors.toList());
         List<Double> ys = samples.stream().map(Point2D::getY).sorted().collect(Collectors.toList());
-        return new Point2D(xs.get(xs.size() / 2), ys.get(ys.size() / 2));
+
+        int n = xs.size();
+        int cut = (int) Math.round(n * trim);
+        if (cut * 2 >= n) cut = 0;
+
+        List<Double> xsTrimmed = xs.subList(cut, n - cut);
+        List<Double> ysTrimmed = ys.subList(cut, n - cut);
+
+        return new Point2D(
+                xsTrimmed.get(xsTrimmed.size() / 2),
+                ysTrimmed.get(ysTrimmed.size() / 2)
+        );
     }
 
     private void finishCalibration() {
         calibrationStage.close();
         if (samples.size() < 3) {
             logger.error("Not enough samples, calibration aborted");
+            showCalibrationError("Калибровка не удалась",
+                    "Собрано слишком мало данных. Проверьте, что лицо видно в камере.");
             if (onComplete != null) onComplete.run();
             return;
         }
 
-        // Выбор типа калибровки: квадратичная (рекомендуется) или линейная
-        boolean useQuadratic = true;
-        if (useQuadratic) {
-            GazeEstimator.QuadraticCalibrationParameters params = calculateQuadraticParams(samples);
-            gazeEstimator.setQuadraticCalibrationParams(params);
-            logger.info("Quadratic calibration params: {}", params);
-        } else {
-            GazeEstimator.CalibrationParameters params = calculateLinearParams(samples);
-            gazeEstimator.setCalibrationParams(params);
-            logger.info("Linear calibration params: {}", params);
+        // ===== ПРОВЕРКА КАЧЕСТВА КАЛИБРОВКИ =====
+        // Если все точки дали почти одинаковые raw-координаты, значит трекинг
+        // не работает или не успел инициализироваться. Применять такую калибровку
+        // НЕЛЬЗЯ — она сломает курсор (как раз твой случай: rawX = -1.5 везде).
+        double minX = Double.POSITIVE_INFINITY, maxX = Double.NEGATIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        for (CalibrationSample s : samples) {
+            minX = Math.min(minX, s.rawX);
+            maxX = Math.max(maxX, s.rawX);
+            minY = Math.min(minY, s.rawY);
+            maxY = Math.max(maxY, s.rawY);
         }
+        double spreadX = maxX - minX;
+        double spreadY = maxY - minY;
+        logger.info("Calibration data spread: X={} Y={}",
+                String.format("%.3f", spreadX), String.format("%.3f", spreadY));
+
+        if (spreadX < MIN_RAW_SPREAD || spreadY < MIN_RAW_SPREAD) {
+            logger.error("Calibration FAILED: insufficient spread (X={}, Y={}). " +
+                            "Eye tracking is not picking up gaze movement.",
+                    String.format("%.3f", spreadX), String.format("%.3f", spreadY));
+            showCalibrationError(
+                    "Калибровка не удалась",
+                    String.format(
+                            "Трекер не зафиксировал движение глаз между точками калибровки.%n%n" +
+                                    "Разброс: X=%.2f, Y=%.2f (требуется минимум %.1f).%n%n" +
+                                    "Возможные причины:%n" +
+                                    "• Программа не успела инициализировать трекер (подождите 2-3 секунды и повторите)%n" +
+                                    "• Камера глаз не видит лицо%n" +
+                                    "• MediaPipe вернул некорректные данные на старте%n%n" +
+                                    "Старая калибровка сохранена.",
+                            spreadX, spreadY, MIN_RAW_SPREAD));
+            if (onComplete != null) onComplete.run();
+            return;
+        }
+
+        // ===== ЛИНЕЙНАЯ КАЛИБРОВКА =====
+        GazeEstimator.CalibrationParameters params = calculateLinearParams(samples);
+
+        // Дополнительная проверка: коэффициенты не должны быть нулевыми
+        if (Math.abs(params.getAx()) < 0.5 || Math.abs(params.getAy()) < 0.5) {
+            logger.error("Calibration FAILED: degenerate coefficients ({})", params);
+            showCalibrationError(
+                    "Калибровка не удалась",
+                    "Получены неадекватные коэффициенты калибровки.\n" +
+                            "Подождите 2-3 секунды после запуска трекинга и повторите.");
+            if (onComplete != null) onComplete.run();
+            return;
+        }
+
+        gazeEstimator.setCalibrationParams(params);
+        logger.info("Linear calibration params: {}", params);
 
         mouseController.setEnabled(true);
         mouseController.resetToCenter();
-        logger.info("Calibration finished");
+        logger.info("Calibration finished successfully");
         if (onComplete != null) onComplete.run();
+    }
+
+    private void showCalibrationError(String title, String message) {
+        Platform.runLater(() -> {
+            Alert alert = new Alert(Alert.AlertType.WARNING);
+            alert.setTitle(title);
+            alert.setHeaderText(null);
+            alert.setContentText(message);
+            alert.showAndWait();
+        });
     }
 
     private void cancelCalibration() {
@@ -179,7 +250,6 @@ public class CalibrationManager {
         if (onComplete != null) onComplete.run();
     }
 
-    /** Линейная калибровка (исходная) */
     private GazeEstimator.CalibrationParameters calculateLinearParams(List<CalibrationSample> samples) {
         int n = samples.size();
         double sw = screenBounds.getWidth();
@@ -207,92 +277,6 @@ public class CalibrationManager {
         double by = (sumTY - ay * sumRY) / n;
 
         return new GazeEstimator.CalibrationParameters(ax, bx, ay, by);
-    }
-
-    /** Квадратичная калибровка: target = a*raw^2 + b*raw + c */
-    private GazeEstimator.QuadraticCalibrationParameters calculateQuadraticParams(List<CalibrationSample> samples) {
-        int n = samples.size();
-        double sw = screenBounds.getWidth();
-        double sh = screenBounds.getHeight();
-
-        // Собираем коэффициенты для систем уравнений (метод наименьших квадратов)
-        // Для X: sum_{i} (a*rawX_i^2 + b*rawX_i + c - targetX_i)^2 -> min
-        // Система:
-        // [ sum(raw^4) sum(raw^3) sum(raw^2) ] [a] = [ sum(raw^2 * target) ]
-        // [ sum(raw^3) sum(raw^2) sum(raw)   ] [b]   [ sum(raw * target)   ]
-        // [ sum(raw^2) sum(raw)   n          ] [c]   [ sum(target)         ]
-        double sumX4 = 0, sumX3 = 0, sumX2 = 0, sumX1 = 0;
-        double sumX2T = 0, sumX1T = 0, sumT = 0;
-        double sumY4 = 0, sumY3 = 0, sumY2 = 0, sumY1 = 0;
-        double sumY2T = 0, sumY1T = 0;
-
-        for (CalibrationSample s : samples) {
-            double rawX = s.rawX;
-            double rawY = s.rawY;
-            double targetX = (s.targetX / sw) * 2 - 1;
-            double targetY = (s.targetY / sh) * 2 - 1;
-
-            double x2 = rawX * rawX;
-            double x3 = x2 * rawX;
-            double x4 = x2 * x2;
-            sumX4 += x4;
-            sumX3 += x3;
-            sumX2 += x2;
-            sumX1 += rawX;
-            sumX2T += x2 * targetX;
-            sumX1T += rawX * targetX;
-            sumT += targetX;
-
-            double y2 = rawY * rawY;
-            double y3 = y2 * rawY;
-            double y4 = y2 * y2;
-            sumY4 += y4;
-            sumY3 += y3;
-            sumY2 += y2;
-            sumY1 += rawY;
-            sumY2T += y2 * targetY;
-            sumY1T += rawY * targetY;
-        }
-
-        // Решаем системы методом Крамера (или можно использовать Apache Commons Math)
-        double[] coeffX = solveCubic(sumX4, sumX3, sumX2, sumX3, sumX2, sumX1, sumX2, sumX1, n,
-                sumX2T, sumX1T, sumT);
-        double[] coeffY = solveCubic(sumY4, sumY3, sumY2, sumY3, sumY2, sumY1, sumY2, sumY1, n,
-                sumY2T, sumY1T, sumT); // sumT для Y тоже используется (сумма targetY)
-
-        return new GazeEstimator.QuadraticCalibrationParameters(coeffX[0], coeffX[1], coeffX[2],
-                coeffY[0], coeffY[1], coeffY[2]);
-    }
-
-    /** Решение системы 3x3 методом Гаусса (возвращает [a,b,c]) */
-    private double[] solveCubic(double a11, double a12, double a13,
-                                double a21, double a22, double a23,
-                                double a31, double a32, double a33,
-                                double b1, double b2, double b3) {
-        double[][] A = {{a11, a12, a13}, {a21, a22, a23}, {a31, a32, a33}};
-        double[] B = {b1, b2, b3};
-        int n = 3;
-        for (int i = 0; i < n; i++) {
-            int max = i;
-            for (int j = i + 1; j < n; j++)
-                if (Math.abs(A[j][i]) > Math.abs(A[max][i])) max = j;
-            double[] temp = A[i]; A[i] = A[max]; A[max] = temp;
-            double t = B[i]; B[i] = B[max]; B[max] = t;
-            for (int j = i + 1; j < n; j++) {
-                double factor = A[j][i] / A[i][i];
-                B[j] -= factor * B[i];
-                for (int k = i; k < n; k++)
-                    A[j][k] -= factor * A[i][k];
-            }
-        }
-        double[] X = new double[n];
-        for (int i = n - 1; i >= 0; i--) {
-            double sum = 0;
-            for (int j = i + 1; j < n; j++)
-                sum += A[i][j] * X[j];
-            X[i] = (B[i] - sum) / A[i][i];
-        }
-        return X; // [a, b, c]
     }
 
     public static class CalibrationPoint {
