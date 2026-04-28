@@ -452,7 +452,7 @@ public class GazeEstimator {
         double dx    = Math.abs(raw.getX() - prevX);
         double dy    = Math.abs(raw.getY() - prevY);
         double speed = Math.sqrt(dx * dx + dy * dy);
-        double alpha = Math.min(0.4, Math.max(0.05, 0.15 / (speed + 0.1)));
+        double alpha = Math.min(0.12, Math.max(0.02, 0.08 / (speed + 0.1)));  // замедлено: max 12% изменения за кадр
         double sx    = prevX + alpha * (raw.getX() - prevX);
         double sy    = prevY + alpha * (raw.getY() - prevY);
         prevX = sx; prevY = sy;
