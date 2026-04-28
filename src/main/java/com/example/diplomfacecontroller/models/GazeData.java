@@ -11,6 +11,15 @@ public class GazeData {
     private double blinkRate;
     private long lastBlinkTime;
 
+    /** НОВОЕ: признак того что брови сейчас подняты (выше базового уровня). */
+    private boolean browsRaised;
+
+    /** НОВОЕ: триггер — событие "бровь поднялась" (rising edge).
+     *  Устанавливается в true ровно на одном кадре, когда происходит переход
+     *  "опущена → поднята". Используется для дискретных действий
+     *  (нажатие клавиши на клавиатуре). */
+    private boolean browTriggerEvent;
+
     public GazeData() {
         this.leftEyeGaze = new Point2D(0, 0);
         this.rightEyeGaze = new Point2D(0, 0);
@@ -19,9 +28,10 @@ public class GazeData {
         this.rightEyeClosed = false;
         this.blinkRate = 0;
         this.lastBlinkTime = 0;
+        this.browsRaised = false;
+        this.browTriggerEvent = false;
     }
 
-    // Геттеры и сеттеры
     public Point2D getLeftEyeGaze() { return leftEyeGaze; }
     public void setLeftEyeGaze(Point2D leftEyeGaze) { this.leftEyeGaze = leftEyeGaze; }
 
@@ -42,6 +52,12 @@ public class GazeData {
 
     public long getLastBlinkTime() { return lastBlinkTime; }
     public void setLastBlinkTime(long lastBlinkTime) { this.lastBlinkTime = lastBlinkTime; }
+
+    public boolean isBrowsRaised() { return browsRaised; }
+    public void setBrowsRaised(boolean browsRaised) { this.browsRaised = browsRaised; }
+
+    public boolean isBrowTriggerEvent() { return browTriggerEvent; }
+    public void setBrowTriggerEvent(boolean browTriggerEvent) { this.browTriggerEvent = browTriggerEvent; }
 
     public boolean isBlinking() {
         return leftEyeClosed && rightEyeClosed;

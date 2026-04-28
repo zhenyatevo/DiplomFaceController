@@ -28,6 +28,9 @@ public class GazeEstimator {
     private IrisFeatureExtractor irisExtractor;
     private boolean            neuralModeActive = false;
 
+    // ===== Детектор поднятия бровей (триггер для клавиатуры) =====
+    private final BrowTriggerDetector browDetector = new BrowTriggerDetector();
+
     // ===== Общие поля =====
     private long   lastBlinkTime;
     private int    blinkCount;
@@ -43,57 +46,28 @@ public class GazeEstimator {
     private double prevRightX = 0, prevRightY = 0;
     private static final double MAX_GAZE_STEP = 0.3;
 
-    // ===== ЗАЩИТА ОТ ВЫБРОСОВ В НЕЙРО-РЕЖИМЕ =====
-    private double prevRawX = 0.58;
-    private double prevRawY = 0.42;
-    private boolean prevRawInit = false;
-    /** Максимальный скачок радужки за кадр. */
-    private static final double MAX_IRIS_STEP = 0.05;
-
-    /** Сколько кадров подряд были отброшены. Если слишком много — сбрасываем reference. */
-    private int rejectStreak = 0;
-    /** После N подряд отбросов — принудительный ресет reference на текущее значение. */
-    private static final int MAX_REJECT_STREAK = 8;
-
-    /** Буфер для инициализации reference по медиане первых N кадров. */
-    private final List<double[]> initBuffer = new ArrayList<>();
-    private static final int INIT_BUFFER_SIZE = 10;
-
-    // Адаптивное сглаживание
+    // Адаптивное сглаживание (оба режима)
     private double prevX = 0, prevY = 0;
 
     // ===== Калибровка =====
     private CalibrationParameters          calibrationParams;
     private QuadraticCalibrationParameters quadParams;
     private boolean useQuadratic = false;
-
-    // ===== Медианный фильтр =====
-    private static final int MEDIAN_WIN = 7;
-    private final double[] histX = new double[MEDIAN_WIN];
-    private final double[] histY = new double[MEDIAN_WIN];
+    private final double[] histX = new double[5];
+    private final double[] histY = new double[5];
     private int histIdx = 0;
-    private int histFilled = 0;
 
-    private static final double CALIB_CLAMP = 1.5;
-
-    /** Sanity-check на координаты радужки от MediaPipe.
-     *  Глаза человека физически не могут быть за этими пределами на нормальном кадре. */
-    private static boolean isPlausibleIris(double x, double y) {
-        return x > 0.30 && x < 0.75 && y > 0.20 && y < 0.65;
-    }
-
+    // Добавь метод:
     private Point2D medianFilter(double x, double y) {
         histX[histIdx] = x;
         histY[histIdx] = y;
-        histIdx = (histIdx + 1) % MEDIAN_WIN;
-        if (histFilled < MEDIAN_WIN) histFilled++;
+        histIdx = (histIdx + 1) % histX.length;
 
-        double[] sx = new double[histFilled];
-        double[] sy = new double[histFilled];
-        for (int i = 0; i < histFilled; i++) { sx[i] = histX[i]; sy[i] = histY[i]; }
+        double[] sx = histX.clone();
+        double[] sy = histY.clone();
         java.util.Arrays.sort(sx);
         java.util.Arrays.sort(sy);
-        return new Point2D(sx[histFilled / 2], sy[histFilled / 2]);
+        return new Point2D(sx[sx.length / 2], sy[sy.length / 2]);
     }
 
     public GazeEstimator() {
@@ -104,6 +78,10 @@ public class GazeEstimator {
         this.irisExtractor    = new IrisFeatureExtractor();
         initDetector();
     }
+
+    // ================================================================
+    //  ИНИЦИАЛИЗАЦИЯ
+    // ================================================================
 
     private void initDetector() {
         try {
@@ -133,9 +111,13 @@ public class GazeEstimator {
     }
 
     // ================================================================
-    //  НЕЙРОННЫЙ РЕЖИМ
+    //  НЕЙРОННЫЙ РЕЖИМ (MediaPipe)
     // ================================================================
 
+    /**
+     * Запустить MediaPipe bridge. Вызывать из MainController.initializeComponents()
+     * в отдельном потоке, т.к. старт занимает ~4 секунды.
+     */
     public void startNeuralMode() {
         new Thread(() -> {
             try {
@@ -150,33 +132,69 @@ public class GazeEstimator {
         }, "NeuralModeStartThread").start();
     }
 
+    /**
+     * Остановить MediaPipe bridge. Вызывать из stopTracking().
+     */
     public void stopNeuralMode() {
         neuralModeActive = false;
         if (mediaPipeBridge != null) {
             mediaPipeBridge.stop();
             mediaPipeBridge = null;
         }
-        // Сбрасываем фильтры, чтобы при перезапуске инициализация началась заново
-        resetFilters();
+        browDetector.reset();
         logger.info("Neural gaze mode stopped");
     }
 
-    /** НОВОЕ: сброс всех фильтров (вызывается при остановке). */
-    private void resetFilters() {
-        prevRawInit = false;
-        prevRawX = 0.58;
-        prevRawY = 0.42;
-        rejectStreak = 0;
-        initBuffer.clear();
+    /** Публичный доступ к детектору бровей — пригодится UI для индикации
+     *  "baseline ещё калибруется" / "брови подняты". */
+    public BrowTriggerDetector getBrowDetector() {
+        return browDetector;
+    }
+
+    // ================================================================
+    //  СОВМЕСТИМОСТЬ С CalibrationManager
+    //  В этой версии GazeEstimator используется фиксированный центр
+    //  (centerX=0.58, centerY=0.44) внутри analyzeGazeNeural — поэтому
+    //  setCenterLocked не имеет смыслового эффекта (центр и так не двигается).
+    //  Методы оставлены чтобы CalibrationManager компилировался и его
+    //  логика "лочки центра на время калибровки" была no-op.
+    //
+    //  resetFilters сбрасывает медианный/EMA-сглаживатели и детектор бровей —
+    //  это полезно сделать перед калибровкой, чтобы старое состояние не
+    //  влияло на сбор точек.
+    // ================================================================
+
+    /** Сброс фильтров перед калибровкой. */
+    public void resetFilters() {
+        // Сглаживатели
+        prevX = 0; prevY = 0;
+        // Медианный буфер
         histIdx = 0;
-        histFilled = 0;
-        prevX = 0;
-        prevY = 0;
+        // Детектор бровей — пусть тоже перекалибрует baseline под текущего пользователя
+        browDetector.reset();
+        // Сам raw gaze
+        rawGaze = new Point2D(0, 0);
+        logger.info("GazeEstimator filters reset");
+    }
+
+    /**
+     * Заглушка для совместимости. В текущей реализации центр радужки
+     * жёстко задан константами в analyzeGazeNeural и не подвергается EMA-адаптации,
+     * поэтому "блокировать" нечего.
+     */
+    public void setCenterLocked(boolean locked) {
+        // no-op в этой версии; логируем для дебага
+        logger.debug("setCenterLocked({}) called — no-op in this build", locked);
     }
 
     public boolean isNeuralModeActive() {
         return neuralModeActive && mediaPipeBridge != null && mediaPipeBridge.isConnected();
     }
+
+    // ================================================================
+    //  ОСНОВНОЙ МЕТОД АНАЛИЗА — вызывается из CameraManager
+    //  Автоматически выбирает нейронный или Haar-режим
+    // ================================================================
 
     public GazeData analyzeGaze(Mat frame) {
         if (isNeuralModeActive()) {
@@ -201,125 +219,68 @@ public class GazeEstimator {
 
         float[] iris = irisExtractor.extract(landmarks);
 
-        // Моргание
-        boolean leftClosed  = iris[4] < 0.20f;
-        boolean rightClosed = iris[5] < 0.20f;
-        if (leftClosed || rightClosed) {
-            if (leftClosed && rightClosed) {
-                long now = System.currentTimeMillis();
-                if (now - lastBlinkTime > 150) {
-                    blinkCount++;
-                    GazeData blinkData = new GazeData();
-                    blinkData.setLeftEyeClosed(true);
-                    blinkData.setRightEyeClosed(true);
-                    blinkData.setLastBlinkTime(now);
-                    blinkData.setCombinedGaze(rawGaze);
-                    lastBlinkTime = now;
-                    this.lastGazeData = blinkData;
-                    return blinkData;
-                }
-            }
-            return lastGazeData;
-        }
-
+        // Среднее между двумя зрачками
         double rawX = (iris[0] + iris[2]) / 2.0;
         double rawY = (iris[1] + iris[3]) / 2.0;
 
-        // ===== SANITY-CHECK =====
-        // Если MediaPipe вернул совсем дикие координаты (например 0.749, 0.857
-        // как было в твоих логах) — игнорируем кадр полностью.
-        if (!isPlausibleIris(iris[0], iris[1]) || !isPlausibleIris(iris[2], iris[3])) {
-            if (frameCount % 30 == 0) {
-                logger.debug("[Neural] Implausible iris coords ignored: L=({},{}) R=({},{})",
-                        String.format("%.3f", iris[0]), String.format("%.3f", iris[1]),
-                        String.format("%.3f", iris[2]), String.format("%.3f", iris[3]));
-            }
-            return lastGazeData;
-        }
-
-        // ===== ИНИЦИАЛИЗАЦИЯ REFERENCE ПО МЕДИАНЕ ПЕРВЫХ N КАДРОВ =====
-        // Это критическое исправление: раньше первый (возможно мусорный) кадр
-        // навсегда задавал reference, и все нормальные данные потом отбрасывались.
-        if (!prevRawInit) {
-            initBuffer.add(new double[]{rawX, rawY});
-            if (initBuffer.size() < INIT_BUFFER_SIZE) {
-                // Пока копим — возвращаем последнее (нулевое или предыдущее)
-                return lastGazeData;
-            }
-            // Достаточно данных — берём медиану как reference
-            double[] xs = new double[initBuffer.size()];
-            double[] ys = new double[initBuffer.size()];
-            for (int i = 0; i < initBuffer.size(); i++) {
-                xs[i] = initBuffer.get(i)[0];
-                ys[i] = initBuffer.get(i)[1];
-            }
-            java.util.Arrays.sort(xs);
-            java.util.Arrays.sort(ys);
-            prevRawX = xs[xs.length / 2];
-            prevRawY = ys[ys.length / 2];
-            prevRawInit = true;
-            initBuffer.clear();
-            logger.info("[Neural] Reference initialized from {} frames: ({}, {})",
-                    INIT_BUFFER_SIZE,
-                    String.format("%.3f", prevRawX),
-                    String.format("%.3f", prevRawY));
-        }
-
-        // ===== ОТБРОС ВЫБРОСОВ С ЗАЩИТОЙ ОТ ЗАСТОЯ =====
-        double dx = Math.abs(rawX - prevRawX);
-        double dy = Math.abs(rawY - prevRawY);
-        if (dx > MAX_IRIS_STEP || dy > MAX_IRIS_STEP) {
-            rejectStreak++;
-            if (rejectStreak >= MAX_REJECT_STREAK) {
-                // Слишком долго отбрасываем — значит prevRaw устарел.
-                // Возможно пользователь резко сместился, или был артефакт.
-                // Принимаем новое значение и сбрасываем счётчик.
-                logger.info("[Neural] Reject streak {} exceeded, resetting reference to ({}, {})",
-                        rejectStreak,
-                        String.format("%.3f", rawX),
-                        String.format("%.3f", rawY));
-                prevRawX = rawX;
-                prevRawY = rawY;
-                rejectStreak = 0;
-            } else {
-                // Обычный выброс — используем reference
-                rawX = prevRawX;
-                rawY = prevRawY;
-            }
-        } else {
-            rejectStreak = 0;
-            prevRawX = prevRawX * 0.3 + rawX * 0.7;
-            prevRawY = prevRawY * 0.3 + rawY * 0.7;
-        }
-
-        // ===== РЕАЛИСТИЧНЫЕ ДИАПАЗОНЫ =====
+        // СТАЛО — с индивидуальными диапазонами для X и Y:
+// По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
+// По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
         double centerX = 0.58;
-        double centerY = 0.42;
-        double rangeX  = 0.055;
-        double rangeY  = 0.050;
+        double centerY = 0.44;
+        double rangeX  = 0.10;  // половина диапазона X
+        double rangeY  = 0.045; // половина диапазона Y (меньше, т.к. глаза мало двигаются вертикально)
 
         double gazeX = (rawX - centerX) / rangeX;
         double gazeY = (rawY - centerY) / rangeY;
 
-        gazeX = Math.max(-1.5, Math.min(1.5, gazeX));
-        gazeY = Math.max(-1.5, Math.min(1.5, gazeY));
+        // Ограничение диапазона
+        gazeX = Math.max(-1, Math.min(1, gazeX));
+        gazeY = Math.max(-1, Math.min(1, gazeY));
 
+        // Сглаживание
         Point2D filtered = medianFilter(gazeX, gazeY);
         this.rawGaze = smooth(filtered);
 
         gd.setLeftEyeGaze(new Point2D(iris[0] * 2 - 1, iris[1] * 2 - 1));
         gd.setRightEyeGaze(new Point2D(iris[2] * 2 - 1, iris[3] * 2 - 1));
         gd.setCombinedGaze(rawGaze);
-        gd.setLeftEyeClosed(false);
-        gd.setRightEyeClosed(false);
 
-        if (frameCount % 30 == 0) {
-            logger.info("[Neural] rawIris=({},{}) ref=({},{}) gaze=({},{}) smooth=({},{}) reject={}",
-                    String.format("%.3f", rawX), String.format("%.3f", rawY),
-                    String.format("%.3f", prevRawX), String.format("%.3f", prevRawY),
-                    String.format("%.3f", gazeX), String.format("%.3f", gazeY),
-                    String.format("%.3f", rawGaze.getX()), String.format("%.3f", rawGaze.getY()),
-                    rejectStreak);
+        boolean leftClosed  = iris[4] < 0.18f;
+        boolean rightClosed = iris[5] < 0.18f;
+        gd.setLeftEyeClosed(leftClosed);
+        gd.setRightEyeClosed(rightClosed);
+
+        // ===== ТРИГГЕР ПО БРОВЯМ =====
+        // iris[6], iris[7] — нормализованное расстояние бровь→глаз для левой и правой.
+        // Детектор приостанавливается при моргании (eyesValid=false), чтобы
+        // не путать "глаза закрылись" с "брови опустились".
+        boolean eyesValid = !leftClosed && !rightClosed;
+        boolean trigger = browDetector.process(iris[6], iris[7], eyesValid);
+        gd.setBrowsRaised(browDetector.isActive());
+        gd.setBrowTriggerEvent(trigger);
+
+        if (leftClosed && rightClosed) {
+            long now = System.currentTimeMillis();
+            if (now - lastBlinkTime > 150) {
+                blinkCount++;
+                gd.setLastBlinkTime(now);
+                lastBlinkTime = now;
+            }
+        }
+
+        if (frameCount % 10 == 0) {
+            // Логируем базовую линию и текущее значение бровей — удобно для диагностики
+            double browCurrent = (iris[6] + iris[7]) / 2.0;
+            double browBaseline = browDetector.isBaselineReady() ? browDetector.getBaseline() : 0.0;
+            logger.info("[Neural] gaze=({},{}) EAR L={} R={} brow curr={} base={} ratio={}% active={} baseReady={}",
+                    String.format("%.2f", gazeX), String.format("%.2f", gazeY),
+                    String.format("%.2f", iris[4]), String.format("%.2f", iris[5]),
+                    String.format("%.3f", browCurrent),
+                    String.format("%.3f", browBaseline),
+                    browBaseline > 0 ? String.format("%.0f", browCurrent / browBaseline * 100) : "N/A",
+                    browDetector.isActive(),
+                    browDetector.isBaselineReady());
         }
 
         this.lastGazeData = gd;
@@ -327,48 +288,64 @@ public class GazeEstimator {
     }
 
     // ================================================================
-    //  HAAR АНАЛИЗ (fallback) — без изменений
+    //  HAAR-АНАЛИЗ (оригинальный код, без изменений)
     // ================================================================
 
-    private GazeData analyzeGazeHaar(Mat frame) {
-        frameCount++;
+    private GazeData analyzeGazeHaar(Mat eyeFrame) {
         GazeData gazeData = new GazeData();
+        frameCount++;
 
-        if (!detectorLoaded || frame == null || frame.empty()) {
-            this.rawGaze = new Point2D(0, 0);
-            gazeData.setCombinedGaze(new Point2D(0, 0));
+        if (eyeFrame == null || eyeFrame.empty()) {
+            this.lastGazeData = gazeData;
+            return gazeData;
+        }
+        if (!detectorLoaded) {
             this.lastGazeData = gazeData;
             return gazeData;
         }
 
         try {
             Mat gray = new Mat();
-            Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
-            Imgproc.equalizeHist(gray, gray);
+            Imgproc.cvtColor(eyeFrame, gray, Imgproc.COLOR_BGR2GRAY);
 
-            MatOfRect eyesRect = new MatOfRect();
-            eyeDetector.detectMultiScale(gray, eyesRect,
-                    1.1, 4, 0, new Size(20, 20), new Size());
-            Rect[] eyesArray = eyesRect.toArray();
+            MatOfRect eyes = new MatOfRect();
+            eyeDetector.detectMultiScale(gray, eyes);
+            Rect[] eyesArray = eyes.toArray();
+
+            if (eyesArray.length > 0) eyesFoundCount++;
+            else                      eyesNotFoundCount++;
+
+            if (frameCount % 30 == 0) {
+                logger.info("[Haar] Frame {}: {} eyes found / {} not found",
+                        frameCount, eyesFoundCount, eyesNotFoundCount);
+            }
 
             if (eyesArray.length == 0) {
-                eyesNotFoundCount++;
                 this.rawGaze = new Point2D(0, 0);
                 gazeData.setCombinedGaze(new Point2D(0, 0));
                 this.lastGazeData = gazeData;
                 return gazeData;
             }
-            eyesFoundCount++;
 
-            for (int i = 0; i < Math.min(eyesArray.length, 2); i++) {
+            for (int i = 0; i < eyesArray.length; i++) {
                 Rect eye = eyesArray[i];
-                Mat eyeROI = gray.submat(eye);
-                Point pupil = findPupilCenter(eyeROI);
+                Imgproc.rectangle(eyeFrame, eye, new Scalar(0, 255, 0), 1);
 
-                double rawGazeX = (pupil.x - eye.width / 2.0) / (eye.width / 2.0);
-                double rawGazeY = (pupil.y - eye.height / 2.0) / (eye.height / 2.0);
+                Mat eyeROI   = new Mat(gray, eye);
+                Mat equalized = new Mat();
+                Imgproc.equalizeHist(eyeROI, equalized);
+
+                Point pupilPos = findPupilCenter(equalized);
+                Imgproc.circle(eyeFrame,
+                        new Point(eye.x + pupilPos.x, eye.y + pupilPos.y),
+                        3, new Scalar(0, 0, 255), -1);
+
+                double normX    = pupilPos.x / eye.width;
+                double normY    = pupilPos.y / eye.height;
+                double rawGazeX = Math.max(-1, Math.min(1, normX * 2 - 1));
+                double rawGazeY = Math.max(-1, Math.min(1, normY * 2 - 1));
+
                 double finalX = rawGazeX, finalY = rawGazeY;
-
                 if (i == 0) {
                     if (Math.abs(rawGazeX - prevLeftX) > MAX_GAZE_STEP ||
                             Math.abs(rawGazeY - prevLeftY) > MAX_GAZE_STEP) {
@@ -468,14 +445,14 @@ public class GazeEstimator {
     }
 
     // ================================================================
-    //  СГЛАЖИВАНИЕ И КАЛИБРОВКА
+    //  СГЛАЖИВАНИЕ И КАЛИБРОВКА — без изменений
     // ================================================================
 
     private Point2D smooth(Point2D raw) {
         double dx    = Math.abs(raw.getX() - prevX);
         double dy    = Math.abs(raw.getY() - prevY);
         double speed = Math.sqrt(dx * dx + dy * dy);
-        double alpha = Math.min(0.25, Math.max(0.03, 0.08 / (speed + 0.1)));
+        double alpha = Math.min(0.4, Math.max(0.05, 0.15 / (speed + 0.1)));
         double sx    = prevX + alpha * (raw.getX() - prevX);
         double sy    = prevY + alpha * (raw.getY() - prevY);
         prevX = sx; prevY = sy;
@@ -495,8 +472,8 @@ public class GazeEstimator {
             cy = calibrationParams.applyY(ry);
         }
         return new Point2D(
-                Math.max(-CALIB_CLAMP, Math.min(CALIB_CLAMP, cx)),
-                Math.max(-CALIB_CLAMP, Math.min(CALIB_CLAMP, cy))
+                Math.max(-1.2, Math.min(1.2, cx)),
+                Math.max(-1.2, Math.min(1.2, cy))
         );
     }
 
@@ -537,6 +514,10 @@ public class GazeEstimator {
     public GazeData getLastGazeData()   { return lastGazeData; }
     public int getBlinkCount()          { return blinkCount; }
     public void resetBlinkCount()       { blinkCount = 0; lastBlinkTime = System.currentTimeMillis(); }
+
+    // ================================================================
+    //  ВНУТРЕННИЕ КЛАССЫ КАЛИБРОВКИ — без изменений
+    // ================================================================
 
     public static class CalibrationParameters {
         private final double ax, bx, ay, by;

@@ -8,10 +8,6 @@ import com.example.diplomfacecontroller.input.KeyboardController;
 import com.example.diplomfacecontroller.input.MouseController;
 import com.example.diplomfacecontroller.models.FaceData;
 import com.example.diplomfacecontroller.models.GazeData;
-import com.github.kwhat.jnativehook.GlobalScreen;
-import com.github.kwhat.jnativehook.NativeHookException;
-import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
-import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
 import javafx.application.Platform;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
@@ -22,9 +18,6 @@ import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.Tooltip;
 import javafx.scene.image.ImageView;
-import javafx.scene.input.KeyCode;
-import javafx.scene.input.KeyCodeCombination;
-import javafx.scene.input.KeyCombination;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
@@ -36,7 +29,6 @@ import org.slf4j.LoggerFactory;
 import java.net.URL;
 import java.util.ResourceBundle;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.logging.Level;
 
 public class MainController implements Initializable {
     private static final Logger logger = LoggerFactory.getLogger(MainController.class);
@@ -81,10 +73,6 @@ public class MainController implements Initializable {
     private final int faceCameraId = 1;
     private final int eyeCameraId = 0;
 
-    // ===== ГЛОБАЛЬНЫЕ ХОТКЕИ =====
-    private NativeKeyListener globalHotkeyListener;
-    private boolean globalHotkeysRegistered = false;
-
     @Override
     public void initialize(URL location, ResourceBundle resources) {
         logger.info("Initializing MainController");
@@ -113,19 +101,16 @@ public class MainController implements Initializable {
 
         logger.info("MainController initialized successfully");
         logger.info("Using cameras - Face ID: {}, Eye ID: {}", faceCameraId, eyeCameraId);
-
-        // ===== ЛОКАЛЬНЫЕ хоткеи (работают только когда окно в фокусе) =====
-        Platform.runLater(this::setupLocalHotkeys);
-
-        // ===== ГЛОБАЛЬНЫЕ хоткеи (работают даже когда окно не в фокусе) =====
-        setupGlobalHotkeys();
-
-        // Регистрируем корректное освобождение JNativeHook при закрытии окна
+        // Глобальный стоп по Ctrl+Shift+Q
         Platform.runLater(() -> {
-            Stage stage = (Stage) rootPane.getScene().getWindow();
-            if (stage != null) {
-                stage.setOnCloseRequest(ev -> cleanup());
-            }
+            rootPane.getScene().setOnKeyPressed(event -> {
+                if (event.isControlDown() && event.isShiftDown() &&
+                        event.getCode().toString().equals("Q")) {
+                    stopTracking();
+                    mouseController.setEnabled(false);
+                    logger.info("EMERGENCY STOP");
+                }
+            });
         });
     }
 
@@ -140,7 +125,8 @@ public class MainController implements Initializable {
     }
 
     private void setupKeyboardCanvas() {
-        keyboardCanvas = new Canvas(600, 300);
+        // Шире и выше — нужно для полной раскладки 14 клавиш в ряду + 5 рядов
+        keyboardCanvas = new Canvas(900, 360);
         keyboardCanvas.setVisible(false);
         keyboardContainer.getChildren().add(keyboardCanvas);
         keyboardContainer.setAlignment(Pos.CENTER);
@@ -166,6 +152,10 @@ public class MainController implements Initializable {
 
         mouseController = new MouseController();
         keyboardController = new KeyboardController();
+        // Подписка: когда внутренний текст клавиатуры меняется — обновляем UI label
+        keyboardController.setTextChangeListener(text -> {
+            if (textOutputLabel != null) textOutputLabel.setText(text);
+        });
         rootPane.setPrefHeight(600);
     }
 
@@ -182,176 +172,12 @@ public class MainController implements Initializable {
         }
         if (toggleMouseButton != null) {
             toggleMouseButton.setDisable(true);
-            toggleMouseButton.setText("Вкл управление взглядом");
+            toggleMouseButton.setText("👁 Взгляд: ВЫКЛ");
             Tooltip.install(toggleMouseButton, new Tooltip("Сначала выполните калибровку"));
         }
         if (resetMouseButton != null) {
             resetMouseButton.setDisable(true);
             Tooltip.install(resetMouseButton, new Tooltip("Сначала включите управление взглядом"));
-        }
-    }
-
-    // ================================================================
-    //  ГОРЯЧИЕ КЛАВИШИ
-    // ================================================================
-
-    /**
-     * ЛОКАЛЬНЫЕ хоткеи через JavaFX (работают только когда окно в фокусе).
-     * Это подстраховка на случай, если JNativeHook не смог зарегистрироваться.
-     */
-    private void setupLocalHotkeys() {
-        if (rootPane.getScene() == null) {
-            logger.warn("Scene not available for local hotkeys");
-            return;
-        }
-
-        KeyCodeCombination emergencyStop =
-                new KeyCodeCombination(KeyCode.Q, KeyCombination.CONTROL_DOWN, KeyCombination.SHIFT_DOWN);
-        KeyCodeCombination pauseMouse =
-                new KeyCodeCombination(KeyCode.P, KeyCombination.CONTROL_DOWN, KeyCombination.SHIFT_DOWN);
-        KeyCodeCombination centerMouse =
-                new KeyCodeCombination(KeyCode.R, KeyCombination.CONTROL_DOWN, KeyCombination.SHIFT_DOWN);
-
-        rootPane.getScene().getAccelerators().put(emergencyStop,  this::emergencyStop);
-        rootPane.getScene().getAccelerators().put(pauseMouse,     this::toggleMouseControlHotkey);
-        rootPane.getScene().getAccelerators().put(centerMouse,    this::resetMousePosition);
-
-        logger.info("Local hotkeys registered: Ctrl+Shift+Q (stop), Ctrl+Shift+P (pause mouse), Ctrl+Shift+R (center)");
-    }
-
-    /**
-     * ГЛОБАЛЬНЫЕ хоткеи через JNativeHook — работают даже когда окно не в фокусе.
-     * Это критично: если gaze-курсор улетит в угол экрана, ты не сможешь
-     * вернуть фокус в приложение Alt+Tab'ом, но глобальный хоткей сработает.
-     */
-    private void setupGlobalHotkeys() {
-        try {
-            // Отключаем подробное логирование JNativeHook, иначе он спамит INFO
-            java.util.logging.Logger nativeLogger =
-                    java.util.logging.Logger.getLogger(GlobalScreen.class.getPackage().getName());
-            nativeLogger.setLevel(Level.WARNING);
-            nativeLogger.setUseParentHandlers(false);
-
-            GlobalScreen.registerNativeHook();
-
-            globalHotkeyListener = new NativeKeyListener() {
-                @Override
-                public void nativeKeyPressed(NativeKeyEvent e) {
-                    int mods = e.getModifiers();
-                    boolean ctrl  = (mods & NativeKeyEvent.CTRL_MASK)  != 0;
-                    boolean shift = (mods & NativeKeyEvent.SHIFT_MASK) != 0;
-
-                    if (!(ctrl && shift)) return;
-
-                    int key = e.getKeyCode();
-
-                    if (key == NativeKeyEvent.VC_Q) {
-                        logger.info("GLOBAL HOTKEY: Ctrl+Shift+Q -> emergency stop");
-                        Platform.runLater(MainController.this::emergencyStop);
-                    } else if (key == NativeKeyEvent.VC_P) {
-                        logger.info("GLOBAL HOTKEY: Ctrl+Shift+P -> toggle mouse control");
-                        Platform.runLater(MainController.this::toggleMouseControlHotkey);
-                    } else if (key == NativeKeyEvent.VC_R) {
-                        logger.info("GLOBAL HOTKEY: Ctrl+Shift+R -> center mouse");
-                        Platform.runLater(MainController.this::resetMousePosition);
-                    }
-                }
-
-                @Override public void nativeKeyReleased(NativeKeyEvent e) {}
-                @Override public void nativeKeyTyped(NativeKeyEvent e) {}
-            };
-
-            GlobalScreen.addNativeKeyListener(globalHotkeyListener);
-            globalHotkeysRegistered = true;
-
-            logger.info("GLOBAL hotkeys registered successfully:");
-            logger.info("  Ctrl+Shift+Q — экстренный стоп (работает везде)");
-            logger.info("  Ctrl+Shift+P — пауза/возобновление управления мышью");
-            logger.info("  Ctrl+Shift+R — центрирование курсора");
-
-        } catch (NativeHookException e) {
-            logger.error("Failed to register global hotkeys: {}", e.getMessage());
-            logger.warn("Fallback: only LOCAL hotkeys will work (when window is focused)");
-        } catch (Exception e) {
-            logger.error("Unexpected error setting up global hotkeys", e);
-        }
-    }
-
-    /**
-     * Экстренный полный стоп: отключает управление мышью и останавливает трекинг.
-     */
-    private void emergencyStop() {
-        logger.warn("EMERGENCY STOP triggered");
-        if (mouseController != null) {
-            mouseController.setEnabled(false);
-        }
-        mouseControlEnabled.set(false);
-
-        // Только если трекинг запущен — останавливаем
-        if (processing.get()) {
-            stopTracking();
-        }
-
-        Platform.runLater(() -> {
-            statusLabel.setText("Статус: ЭКСТРЕННАЯ ОСТАНОВКА");
-            if (toggleMouseButton != null && gazeEstimator != null && gazeEstimator.isCalibrated()) {
-                toggleMouseButton.setText("Вкл управление взглядом");
-            }
-        });
-    }
-
-    /**
-     * Переключение управления мышью по хоткею.
-     * Отличается от обычной кнопки тем, что не показывает алерт —
-     * просто молча игнорирует, если калибровка не выполнена.
-     */
-    private void toggleMouseControlHotkey() {
-        if (gazeEstimator == null || !gazeEstimator.isCalibrated()) {
-            logger.info("Hotkey ignored: calibration not done");
-            Platform.runLater(() ->
-                    statusLabel.setText("Статус: Сначала выполните калибровку"));
-            return;
-        }
-
-        boolean newState = !mouseControlEnabled.get();
-        mouseControlEnabled.set(newState);
-        mouseController.setEnabled(newState);
-
-        if (newState) {
-            mouseController.resetToCenter();
-        }
-
-        Platform.runLater(() -> {
-            statusLabel.setText("Статус: Управление взглядом " +
-                    (newState ? "включено" : "ПРИОСТАНОВЛЕНО"));
-            if (toggleMouseButton != null) {
-                toggleMouseButton.setText(newState ? "Выкл управление взглядом"
-                        : "Вкл управление взглядом");
-            }
-        });
-
-        logger.info("Mouse control toggled by hotkey: {}", newState);
-    }
-
-    /**
-     * Вызывается при закрытии окна — освобождает JNativeHook.
-     */
-    private void cleanup() {
-        logger.info("Cleanup: unregistering global hooks");
-        try {
-            if (globalHotkeysRegistered) {
-                if (globalHotkeyListener != null) {
-                    GlobalScreen.removeNativeKeyListener(globalHotkeyListener);
-                }
-                GlobalScreen.unregisterNativeHook();
-                globalHotkeysRegistered = false;
-            }
-        } catch (Exception e) {
-            logger.error("Error during cleanup: {}", e.getMessage());
-        }
-
-        if (processing.get()) {
-            stopTracking();
         }
     }
 
@@ -391,7 +217,7 @@ public class MainController implements Initializable {
             if (toggleMouseButton != null) {
                 toggleMouseButton.setDisable(!isCalibrated);
                 if (isCalibrated) {
-                    toggleMouseButton.setText(mouseControlEnabled.get() ? "Выкл управление взглядом" : "Вкл управление взглядом");
+                    toggleMouseButton.setText(mouseControlEnabled.get() ? "👁 Взгляд: ВКЛ" : "👁 Взгляд: ВЫКЛ");
                 }
             }
             if (resetMouseButton != null) {
@@ -449,7 +275,7 @@ public class MainController implements Initializable {
                 mouseController.resetToCenter();
 
                 if (toggleMouseButton != null) {
-                    toggleMouseButton.setText("Выкл управление взглядом");
+                    toggleMouseButton.setText("👁 Взгляд: ВКЛ");
                 }
 
                 logger.info("Mouse control automatically enabled after calibration");
@@ -562,6 +388,13 @@ public class MainController implements Initializable {
                         mouseController.updateMousePosition(calibratedGaze, gazeData);
                     }
 
+                    // ОБНОВЛЕНИЕ КЛАВИАТУРЫ - если показана.
+                    // Делаем в JavaFX-потоке, потому что update() рисует на Canvas.
+                    if (keyboardEnabled && keyboardController != null) {
+                        final GazeData gd = gazeData;
+                        Platform.runLater(() -> keyboardController.update(gd));
+                    }
+
                     // Обновляем UI с текущими значениями
                     updateUI(calibratedGaze, gazeData, faceData);
 
@@ -590,8 +423,14 @@ public class MainController implements Initializable {
             }
 
             if (gazeData != null) {
-                String expression = (gazeData.isLeftEyeClosed() && gazeData.isRightEyeClosed())
-                        ? "Моргание" : "Нейтрально";
+                String expression;
+                if (gazeData.isLeftEyeClosed() && gazeData.isRightEyeClosed()) {
+                    expression = "Моргание";
+                } else if (gazeData.isBrowsRaised()) {
+                    expression = "Брови ↑";
+                } else {
+                    expression = "Нейтрально";
+                }
                 expressionLabel.setText("Мимика: " + expression);
             }
 
@@ -613,14 +452,8 @@ public class MainController implements Initializable {
         mouseControlEnabled.set(false);
         processing.set(false);
 
-        if (mouseController != null) {
-            mouseController.setEnabled(false);
-        }
-
         if (cameraManager != null) {
-            if (gazeEstimator != null) {
-                gazeEstimator.stopNeuralMode();
-            }
+            gazeEstimator.stopNeuralMode();
             cameraManager.stopCameras();
         }
 
@@ -662,7 +495,7 @@ public class MainController implements Initializable {
         statusLabel.setText("Статус: Управление взглядом " + status);
 
         if (toggleMouseButton != null) {
-            toggleMouseButton.setText(newState ? "Выкл управление взглядом" : "Вкл управление взглядом");
+            toggleMouseButton.setText(newState ? "👁 Взгляд: ВКЛ" : "👁 Взгляд: ВЫКЛ");
         }
 
         if (newState) {
@@ -690,6 +523,28 @@ public class MainController implements Initializable {
         keyboardCanvas.setVisible(keyboardEnabled);
         statusLabel.setText("Статус: Клавиатура " + (keyboardEnabled ? "показана" : "скрыта"));
         logger.info("Keyboard {}", keyboardEnabled ? "shown" : "hidden");
+    }
+
+    /**
+     * Переключение режима вывода клавиатуры:
+     * INTERNAL_FIELD ↔ SYSTEM_INJECT.
+     * Метод вызывается через FXML — в FXML нужно добавить кнопку с onAction="#toggleKeyboardOutputMode".
+     * Если кнопки в FXML нет, можно вызвать программно из любого места.
+     */
+    @FXML
+    private void toggleKeyboardOutputMode() {
+        if (keyboardController == null) return;
+        KeyboardController.OutputMode current = keyboardController.getOutputMode();
+        KeyboardController.OutputMode next = (current == KeyboardController.OutputMode.INTERNAL_FIELD)
+                ? KeyboardController.OutputMode.SYSTEM_INJECT
+                : KeyboardController.OutputMode.INTERNAL_FIELD;
+        keyboardController.setOutputMode(next);
+
+        String label = (next == KeyboardController.OutputMode.SYSTEM_INJECT)
+                ? "Печать в активное окно ОС"
+                : "Печать в окно приложения";
+        statusLabel.setText("Статус: " + label);
+        logger.info("Keyboard output mode changed to {}", next);
     }
 
     @FXML

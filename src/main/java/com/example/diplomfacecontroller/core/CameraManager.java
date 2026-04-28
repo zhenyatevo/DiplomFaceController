@@ -238,9 +238,12 @@ public class CameraManager {
                 while (running && faceCameraReady.get()) {
                     try {
                         if (faceCamera != null && faceCamera.read(frame) && !frame.empty()) {
-                            // Кадр уже нужного размера, просто конвертируем
-                            final Image image = ImageUtils.mat2Image(frame);
+                            // Передаём кадр лица в GazeEstimator (MediaPipe видит всё лицо + брови)
+                            if (gazeEstimator != null) {
+                                gazeEstimator.analyzeGaze(frame);
+                            }
 
+                            final Image image = ImageUtils.mat2Image(frame);
                             synchronized (faceLock) {
                                 latestFaceImage = image;
                                 faceImageUpdated = true;
@@ -266,24 +269,7 @@ public class CameraManager {
                     try {
                         if (eyeCamera != null && eyeCamera.read(frame) && !frame.empty()) {
 
-                            // ========== ДОБАВЛЕННАЯ ОТЛАДКА ==========
-                            // Проверяем, получен ли кадр от камеры глаз
-                            if (eyeCaptureFrames % 30 == 0) {
-                                logger.info("Eye camera frame received: {}x{}", frame.width(), frame.height());
-                            }
-
-                            // Передаем кадр в GazeEstimator для анализа, если он установлен
-                            if (gazeEstimator != null) {
-                                GazeData gazeData = gazeEstimator.analyzeGaze(frame);
-                                if (eyeCaptureFrames % 30 == 0 && gazeData != null) {
-                                    logger.info("Gaze data after analysis: combined={}", gazeData.getCombinedGaze());
-                                }
-                            } else {
-                                if (eyeCaptureFrames % 30 == 0) {
-                                    logger.warn("GazeEstimator not set in CameraManager");
-                                }
-                            }
-                            // ========== КОНЕЦ ДОБАВЛЕННОЙ ОТЛАДКИ ==========
+                            // Камера глаз — только для отображения крупным планом
 
                             // Конвертируем для отображения
                             final Image image = ImageUtils.mat2Image(frame);
