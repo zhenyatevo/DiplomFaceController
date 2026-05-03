@@ -238,11 +238,6 @@ public class CameraManager {
                 while (running && faceCameraReady.get()) {
                     try {
                         if (faceCamera != null && faceCamera.read(frame) && !frame.empty()) {
-                            // Передаём кадр лица в GazeEstimator (MediaPipe видит всё лицо + брови)
-                            if (gazeEstimator != null) {
-                                gazeEstimator.analyzeGaze(frame);
-                            }
-
                             final Image image = ImageUtils.mat2Image(frame);
                             synchronized (faceLock) {
                                 latestFaceImage = image;
@@ -269,7 +264,13 @@ public class CameraManager {
                     try {
                         if (eyeCamera != null && eyeCamera.read(frame) && !frame.empty()) {
 
-                            // Камера глаз — только для отображения крупным планом
+                            // Камера глаз — передаём в GazeEstimator (та же камера что работала раньше)
+                            if (gazeEstimator != null) {
+                                GazeData gazeData = gazeEstimator.analyzeGaze(frame);
+                                if (eyeCaptureFrames % 30 == 0 && gazeData != null) {
+                                    logger.info("Gaze data: combined={}", gazeData.getCombinedGaze());
+                                }
+                            }
 
                             // Конвертируем для отображения
                             final Image image = ImageUtils.mat2Image(frame);

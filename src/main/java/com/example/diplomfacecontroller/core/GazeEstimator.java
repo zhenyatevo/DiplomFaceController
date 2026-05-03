@@ -255,6 +255,7 @@ public class GazeEstimator {
         // iris[6], iris[7] — нормализованное расстояние бровь→глаз для левой и правой.
         // Детектор приостанавливается при моргании (eyesValid=false), чтобы
         // не путать "глаза закрылись" с "брови опустились".
+        // eyesValid: глаза открыты. Доп. защита в BrowTriggerDetector через min browDist
         boolean eyesValid = !leftClosed && !rightClosed;
         boolean trigger = browDetector.process(iris[6], iris[7], eyesValid);
         gd.setBrowsRaised(browDetector.isActive());

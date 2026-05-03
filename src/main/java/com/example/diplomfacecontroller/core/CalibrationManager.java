@@ -342,6 +342,22 @@ public class CalibrationManager {
             String missing = !useX ? "горизонтально (X)" : "вертикально (Y)";
             String working = !useX ? "вертикально (Y)" : "горизонтально (X)";
             logger.warn("Only one axis is usable: {} works, {} too noisy", working, missing);
+            if (!useY) {
+                // Камера не захватывает вертикальный диапазон — наклоните её чуть вниз.
+                // Временно используем фиксированный масштаб Y на основе среднего значения радужки
+                double meanRawY = samples.stream().mapToDouble(s -> s.rawY).average().orElse(0.5);
+                // Предполагаем диапазон ±0.08 от центра (типично для глазной камеры)
+                double estimatedScale = -25.0;  // -1 / 0.04 примерно
+                double estimatedOffset = 1.0 - estimatedScale * meanRawY;
+                logger.warn("[Cal] Y fallback: meanRawY={} scale={} offset={}",
+                        String.format("%.3f", meanRawY),
+                        String.format("%.1f", estimatedScale),
+                        String.format("%.1f", estimatedOffset));
+                // Обновляем params с Y fallback
+                params = new GazeEstimator.CalibrationParameters(
+                        params.getAx(), params.getBx(), estimatedScale, estimatedOffset);
+                useY = true;
+            }
             Platform.runLater(() -> {
                 Alert alert = new Alert(Alert.AlertType.INFORMATION);
                 alert.setTitle("Калибровка частично удалась");

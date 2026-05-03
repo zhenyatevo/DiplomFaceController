@@ -48,7 +48,7 @@ public class BrowTriggerDetector {
     private static final long TRIGGER_COOLDOWN_MS = 800;
 
     /** Скорость медленной адаптации baseline (когда не активен). */
-    private static final double BASELINE_EMA_ALPHA = 0.005;
+    private static final double BASELINE_EMA_ALPHA = 0.002;
 
     // ===== Состояние =====
     private final Deque<Double> baselineBuffer = new ArrayDeque<>();
@@ -81,6 +81,12 @@ public class BrowTriggerDetector {
         }
 
         double current = (leftBrowDist + rightBrowDist) / 2.0;
+
+        // Защита: если brow_dist аномально мал (взгляд вниз искажает геометрию) — пропускаем
+        // Нормальное значение 0.8-1.5, при прищуре/взгляде вниз падает до 0.5 и ниже
+        if (current < 0.70) {
+            return false;
+        }
 
         // ===== ФАЗА 1: накопление baseline =====
         if (!baselineReady) {

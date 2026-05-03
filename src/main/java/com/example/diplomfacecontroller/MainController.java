@@ -23,6 +23,8 @@ import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.geometry.Pos;
 import javafx.stage.Stage;
+import java.awt.MouseInfo;
+import java.awt.Point;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,6 +54,11 @@ public class MainController implements Initializable {
     @FXML private Button stopButton;
     @FXML private Button toggleMouseButton;
     @FXML private Button resetMouseButton;
+
+    // Gaze-hover для кнопок тулбара — подтверждение подъёмом бровей
+    private Button gazeHoveredButton = null;
+    private long gazeHoverStartMs = 0;
+    private static final long GAZE_HOVER_CONFIRM_MS = 1500;
 
     private final ImageView camera1View = new ImageView();
     private final ImageView camera2View = new ImageView();
@@ -126,7 +133,7 @@ public class MainController implements Initializable {
 
     private void setupKeyboardCanvas() {
         // Шире и выше — нужно для полной раскладки 14 клавиш в ряду + 5 рядов
-        keyboardCanvas = new Canvas(900, 360);
+        keyboardCanvas = new Canvas(780, 270);  // уменьшено чтобы влезть на экран 1280x720
         keyboardCanvas.setVisible(false);
         keyboardContainer.getChildren().add(keyboardCanvas);
         keyboardContainer.setAlignment(Pos.CENTER);
@@ -395,6 +402,13 @@ public class MainController implements Initializable {
                         Platform.runLater(() -> keyboardController.update(gd));
                     }
 
+                    // GAZE HOVER для кнопок тулбара
+                    if (calibratedGaze != null && gazeData != null) {
+                        final GazeData gdBtn = gazeData;
+                        final Point2D cgBtn = calibratedGaze;
+                        Platform.runLater(() -> updateGazeButtons(cgBtn, gdBtn));
+                    }
+
                     // Обновляем UI с текущими значениями
                     updateUI(calibratedGaze, gazeData, faceData);
 
@@ -413,6 +427,67 @@ public class MainController implements Initializable {
         }, "DataProcessingThread");
 
         dataProcessingThread.start();
+    }
+
+    /**
+     * Определяет какая кнопка под курсором и активирует её при подъёме бровей.
+     * Ищет все Button-компоненты в сцене — тулбар, диалоги и т.д.
+     * Вызывается в JavaFX-потоке.
+     */
+    private void updateGazeButtons(Point2D calibratedGaze, GazeData gazeData) {
+        // Ищем все активные кнопки в сцене через lookup
+        java.util.List<Button> allButtons = new java.util.ArrayList<>();
+        try {
+            if (rootPane != null && rootPane.getScene() != null) {
+                rootPane.getScene().getRoot().lookupAll(".button").forEach(node -> {
+                    if (node instanceof Button) {
+                        Button btn = (Button) node;
+                        if (!btn.isDisable() && btn.isVisible()) {
+                            allButtons.add(btn);
+                        }
+                    }
+                });
+            }
+        } catch (Exception ignored) {}
+
+        // Находим кнопку под курсором мыши
+        java.awt.Point mousePos = java.awt.MouseInfo.getPointerInfo().getLocation();
+        Button nowHovered = null;
+        for (Button btn : allButtons) {
+            try {
+                javafx.geometry.Bounds bounds = btn.localToScreen(btn.getBoundsInLocal());
+                if (bounds != null && bounds.contains(mousePos.x, mousePos.y)) {
+                    nowHovered = btn;
+                    break;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        long now = System.currentTimeMillis();
+
+        if (nowHovered != gazeHoveredButton) {
+            // Сброс подсветки старой кнопки
+            if (gazeHoveredButton != null) {
+                gazeHoveredButton.setStyle("");
+            }
+            gazeHoveredButton = nowHovered;
+            gazeHoverStartMs = now;
+            // Подсветить новую
+            if (gazeHoveredButton != null) {
+                gazeHoveredButton.setStyle("-fx-border-color: #ff6600; -fx-border-width: 2;");
+            }
+        }
+
+        // Подтверждение: подъём бровей при наведённом взгляде
+        if (gazeHoveredButton != null && gazeData != null && gazeData.isBrowTriggerEvent()) {
+            Button toClick = gazeHoveredButton;
+            // Сбрасываем подсветку
+            toClick.setStyle("");
+            gazeHoveredButton = null;
+            // Имитируем клик
+            toClick.fire();
+            logger.info("Gaze-brow click: {}", toClick.getText());
+        }
     }
 
     private void updateUI(Point2D calibratedGaze, GazeData gazeData, FaceData faceData) {

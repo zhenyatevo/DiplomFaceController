@@ -27,7 +27,7 @@ public class MouseController {
      * 0.75 = агрессивное сглаживание (было 0.55/0.6) — курсор едва заметно
      * дёргается при фиксации взгляда.
      */
-    private double smoothingFactor = 0.96;  // увеличено — курсор движется медленнее и плавнее
+    private double smoothingFactor = 0.975; // дополнительно замедлено
 
     private double sensitivity = 1.0;
 
@@ -35,7 +35,7 @@ public class MouseController {
      * Мёртвая зона от центра (в нормированных координатах gaze).
      * Увеличена с 0.04 до 0.06 — меньше ложных движений у центра.
      */
-    private double deadZoneRadius = 0.10;  // увеличена мёртвая зона центра
+    private double deadZoneRadius = 0.08;  // небольшая мёртвая зона
 
     /**
      * Усиление gaze для достижения краёв.
@@ -60,14 +60,14 @@ public class MouseController {
      * Это убирает мелкое дёргание на уровне 1-2 пикселя.
      * Увеличено с 2-3 до 5 пикселей — заметно стабильнее при чтении.
      */
-    private static final int PIXEL_DEADBAND = 12;  // не двигать мышь при смещении < 12px
+    private static final int PIXEL_DEADBAND = 8;   // уменьшен дедбенд — меньше залипания
 
     /**
      * НОВОЕ: ограничение максимальной скорости курсора.
      * Если цель внезапно дальше MAX_STEP_PX — делаем шаг на MAX_STEP_PX,
      * а не прыжок на весь экран. Защищает от резких рывков при выбросах gaze.
      */
-    private static final int MAX_STEP_PX = 35;  // максимальный шаг 35px за кадр
+    private static final int MAX_STEP_PX = 18;  // ограничен шаг для плавности
 
     // Клики
     private long lastBlinkTime = 0;

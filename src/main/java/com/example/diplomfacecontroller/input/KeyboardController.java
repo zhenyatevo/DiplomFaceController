@@ -63,6 +63,9 @@ public class KeyboardController {
     private KeyboardKey hoverKey = null;
     private long hoverEnterTime  = 0;
     private boolean lastBrowsRaised = false;  // для индикатора в статус-баре
+    /** Время последней активации клавиши — защита от двойного срабатывания. */
+    private long lastActivationTime = 0;
+    private static final long KEY_COOLDOWN_MS = 1200;  // мин. интервал между нажатиями
 
     /** Минимальное время удержания взгляда на клавише до того, как
      *  триггер по бровям сможет её активировать. Защищает от случайных
@@ -76,10 +79,10 @@ public class KeyboardController {
     private final SystemTextInjector systemInjector = new SystemTextInjector();
 
     /** Размеры клавиш — могут перевычисляться при смене размера canvas. */
-    private double keyW   = 56;
-    private double keyH   = 56;
-    private double pad    = 6;
-    private double startY = 32;  // сдвинуто вниз из-за статус-бара
+    private double keyW   = 48;
+    private double keyH   = 44;
+    private double pad    = 5;
+    private double startY = 28;  // сдвинуто вниз из-за статус-бара
 
     public KeyboardController() {
         // Раскладка строится динамически в layoutKeys() при первом drawKeyboard
@@ -133,8 +136,13 @@ public class KeyboardController {
 
         // Подгоняем размер клавиши под ширину canvas (14 клавиш в самом длинном ряду)
         double cw = canvas.getWidth();
-        keyW = Math.max(40, (cw - pad * 16) / 14.0);
-        keyH = keyW;
+        double ch = canvas.getHeight();
+        // Ширина клавиши по самому широкому ряду (14 клавиш)
+        keyW = Math.max(36, (cw - pad * 15) / 14.0);
+        // Высота клавиши: подгоняем под высоту canvas (5 рядов)
+        double statusH = 22;  // статус-бар сверху
+        keyH = Math.max(30, (ch - statusH - pad * 4) / 5.0);
+        startY = (int) statusH;
 
         for (int r = 0; r < rowsLower.length; r++) {
             String[] lower = rowsLower[r];
@@ -234,8 +242,12 @@ public class KeyboardController {
             lastBrowsRaised = gazeData.isBrowsRaised();
         }
         if (gazeData != null && gazeData.isBrowTriggerEvent() && hoverKey != null) {
-            activateKey(hoverKey);
-            hoverEnterTime = now;
+            // Защита от двойного нажатия: игнорируем если прошло меньше KEY_COOLDOWN_MS
+            if (now - lastActivationTime >= KEY_COOLDOWN_MS) {
+                activateKey(hoverKey);
+                lastActivationTime = now;
+                hoverEnterTime = now;
+            }
         }
 
         drawKeyboard();
