@@ -35,14 +35,14 @@ public class BrowTriggerDetector {
     /** На сколько процентов выше baseline считаем брови "поднятыми".
      *  0.20 = на 20%. Для большинства людей "осознанное" поднятие
      *  бровей даёт +30-60%, а микро-движения <10%. */
-    private static final double RISE_THRESHOLD = 0.12;
+    private static final double RISE_THRESHOLD = 0.20;
 
     /** Порог сброса (гистерезис): пока выше — считаем активным.
      *  Должен быть МЕНЬШЕ RISE_THRESHOLD. */
     private static final double FALL_THRESHOLD = 0.07;
 
     /** Сколько кадров подряд должно держаться превышение, чтобы стало "активно". */
-    private static final int MIN_RISE_FRAMES = 3;      // ~130 мс
+    private static final int MIN_RISE_FRAMES = 4;      // ~170 мс
 
     /** Минимальный интервал между триггерами (мс). */
     private static final long TRIGGER_COOLDOWN_MS = 800;

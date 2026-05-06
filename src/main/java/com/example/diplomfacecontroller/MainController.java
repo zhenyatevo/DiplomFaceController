@@ -100,6 +100,11 @@ public class MainController implements Initializable {
         // Инициализация менеджеров и процессоров
         initializeComponents();
 
+        // Сразу отрисовываем клавиатуру
+        if (keyboardController != null && keyboardCanvas != null) {
+            keyboardController.setKeyboardVisible(true, keyboardCanvas);
+        }
+
         // Инициализация состояния кнопок
         initializeButtons();
 
@@ -133,10 +138,11 @@ public class MainController implements Initializable {
 
     private void setupKeyboardCanvas() {
         // Шире и выше — нужно для полной раскладки 14 клавиш в ряду + 5 рядов
-        keyboardCanvas = new Canvas(780, 270);  // уменьшено чтобы влезть на экран 1280x720
-        keyboardCanvas.setVisible(false);
+        keyboardCanvas = new Canvas(580, 200);  // компактный размер
+        keyboardCanvas.setVisible(true);
         keyboardContainer.getChildren().add(keyboardCanvas);
         keyboardContainer.setAlignment(Pos.CENTER);
+        keyboardEnabled = true;
     }
 
     private void resetUIDisplay() {
@@ -159,6 +165,13 @@ public class MainController implements Initializable {
 
         mouseController = new MouseController();
         keyboardController = new KeyboardController();
+        Platform.runLater(() -> {
+            if (rootPane.getScene() != null &&
+                    rootPane.getScene().getWindow() instanceof javafx.stage.Stage) {
+                keyboardController.setOwnerStage(
+                        (javafx.stage.Stage) rootPane.getScene().getWindow());
+            }
+        });
         // Подписка: когда внутренний текст клавиатуры меняется — обновляем UI label
         keyboardController.setTextChangeListener(text -> {
             if (textOutputLabel != null) textOutputLabel.setText(text);
@@ -202,6 +215,7 @@ public class MainController implements Initializable {
         };
         cameraStatusChecker.start();
     }
+
 
     private void updateButtonStates() {
         boolean camerasRunning = cameraManager != null && cameraManager.isRunning();
@@ -285,6 +299,7 @@ public class MainController implements Initializable {
                     toggleMouseButton.setText("👁 Взгляд: ВКЛ");
                 }
 
+                mouseController.setGlobalClickEnabled(true);
                 logger.info("Mouse control automatically enabled after calibration");
             }
 
@@ -399,7 +414,15 @@ public class MainController implements Initializable {
                     // Делаем в JavaFX-потоке, потому что update() рисует на Canvas.
                     if (keyboardEnabled && keyboardController != null) {
                         final GazeData gd = gazeData;
-                        Platform.runLater(() -> keyboardController.update(gd));
+                        final boolean skipBrow = mouseController.wasRecentlyClicked();
+                        Platform.runLater(() -> keyboardController.update(
+                                skipBrow ? null : gd));
+                    }
+
+                    // ГЛОБАЛЬНЫЙ КЛИК бровями (если клавиатура скрыта)
+                    // Клавиатура использует брови для клавиш — не конфликтуем
+                    if (mouseControlEnabled.get()) {
+                        mouseController.processGlobalBrowClick(gazeData);
                     }
 
                     // GAZE HOVER для кнопок тулбара
@@ -442,7 +465,11 @@ public class MainController implements Initializable {
                 rootPane.getScene().getRoot().lookupAll(".button").forEach(node -> {
                     if (node instanceof Button) {
                         Button btn = (Button) node;
-                        if (!btn.isDisable() && btn.isVisible()) {
+                        String bTxt = btn.getText() == null ? "" : btn.getText();
+                        // Исключаем из gaze-hover кнопки которые легко нажать случайно
+                        boolean excluded = bTxt.contains("⇄") || bTxt.contains("Режим")
+                                || bTxt.contains("⌨") || bTxt.contains("Клавиатура");
+                        if (!btn.isDisable() && btn.isVisible() && !excluded) {
                             allButtons.add(btn);
                         }
                     }
@@ -474,7 +501,7 @@ public class MainController implements Initializable {
             gazeHoverStartMs = now;
             // Подсветить новую
             if (gazeHoveredButton != null) {
-                gazeHoveredButton.setStyle("-fx-border-color: #ff6600; -fx-border-width: 2;");
+                gazeHoveredButton.setStyle("-fx-background-color: rgba(33,150,243,0.25);");
             }
         }
 

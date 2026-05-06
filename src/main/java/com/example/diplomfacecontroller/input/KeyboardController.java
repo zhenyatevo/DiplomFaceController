@@ -12,6 +12,7 @@ import javafx.scene.text.FontWeight;
 import javafx.scene.text.TextAlignment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import javafx.stage.Stage;
 
 import java.awt.MouseInfo;
 import java.awt.Point;
@@ -77,6 +78,9 @@ public class KeyboardController {
 
     private OutputMode outputMode = OutputMode.INTERNAL_FIELD;
     private final SystemTextInjector systemInjector = new SystemTextInjector();
+    private Stage ownerStage;
+
+    public void setOwnerStage(Stage stage) { this.ownerStage = stage; }
 
     /** Размеры клавиш — могут перевычисляться при смене размера canvas. */
     private double keyW   = 48;
@@ -279,6 +283,10 @@ public class KeyboardController {
     /** Активация клавиши — основной обработчик нажатия. */
     private void activateKey(KeyboardKey key) {
         key.setPressed(true);
+        // При OS-вводе небольшая пауза для передачи фокуса
+        if (outputMode == OutputMode.SYSTEM_INJECT) {
+            try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+        }
         // Снимем "нажатость" через 150 мс (визуальный feedback)
         new Thread(() -> {
             try { Thread.sleep(150); } catch (InterruptedException ignored) {}

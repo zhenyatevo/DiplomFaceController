@@ -36,6 +36,9 @@ public class GazeEstimator {
     private int    blinkCount;
     private Point2D rawGaze;
     private GazeData lastGazeData;
+    // Адаптивный центр Y — EMA по первым 60 кадрам
+    private double adaptCenterY = 0.44;
+    private int adaptCenterYCount = 0;
 
     private int frameCount       = 0;
     private int eyesFoundCount   = 0;
@@ -168,6 +171,8 @@ public class GazeEstimator {
     public void resetFilters() {
         // Сглаживатели
         prevX = 0; prevY = 0;
+        // Сброс адаптивного центра: переоткалибруется по новым кадрам
+        adaptCenterY = 0.44; adaptCenterYCount = 0;
         // Медианный буфер
         histIdx = 0;
         // Детектор бровей — пусть тоже перекалибрует baseline под текущего пользователя
@@ -227,9 +232,19 @@ public class GazeEstimator {
 // По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
 // По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
         double centerX = 0.58;
-        double centerY = 0.44;
-        double rangeX  = 0.10;  // половина диапазона X
-        double rangeY  = 0.045; // половина диапазона Y (меньше, т.к. глаза мало двигаются вертикально)
+        // Адаптивный centerY: обновляем пока не накопим 60 кадров
+        if (rawY > 0.05 && rawY < 0.95) { // игнорируем выбросы
+            if (adaptCenterYCount < 60) {
+                adaptCenterY = adaptCenterY * 0.88 + rawY * 0.12;
+                adaptCenterYCount++;
+                if (adaptCenterYCount == 60)
+                    logger.info("[GazeEst] Adaptive centerY LOCKED: {}",
+                            String.format("%.3f", adaptCenterY));
+            }
+        }
+        double centerY = adaptCenterY;
+        double rangeX  = 0.10;
+        double rangeY  = 0.065; // увеличен для компенсации наклона камеры
 
         double gazeX = (rawX - centerX) / rangeX;
         double gazeY = (rawY - centerY) / rangeY;

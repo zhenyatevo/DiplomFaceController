@@ -345,10 +345,11 @@ public class CalibrationManager {
             if (!useY) {
                 // Камера не захватывает вертикальный диапазон — наклоните её чуть вниз.
                 // Временно используем фиксированный масштаб Y на основе среднего значения радужки
-                double meanRawY = samples.stream().mapToDouble(s -> s.rawY).average().orElse(0.5);
-                // Предполагаем диапазон ±0.08 от центра (типично для глазной камеры)
-                double estimatedScale = -25.0;  // -1 / 0.04 примерно
-                double estimatedOffset = 1.0 - estimatedScale * meanRawY;
+                // Если Y не работает - используем нейтральный прямой маппинг
+                // gazeY уже в [-1,1], маппируем напрямую
+                double estimatedScale = -1.0;  // прямой маппинг
+                double estimatedOffset = 0.0;  // нейтральный центр
+                double meanRawY = 0.0; // не используется
                 logger.warn("[Cal] Y fallback: meanRawY={} scale={} offset={}",
                         String.format("%.3f", meanRawY),
                         String.format("%.1f", estimatedScale),

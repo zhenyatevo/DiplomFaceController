@@ -14,6 +14,10 @@ public class MouseController {
     private static final Logger logger = LoggerFactory.getLogger(MouseController.class);
 
     private Robot robot;
+    /** Глобальный клик бровями — кликать по любому окну Windows */
+    private volatile boolean globalClickEnabled = false;
+    private long lastGlobalClickMs = 0;
+    private static final long GLOBAL_CLICK_COOLDOWN_MS = 900;
     private Dimension screenSize;
 
     private boolean enabled = false;
@@ -21,13 +25,15 @@ public class MouseController {
     // ===== СГЛАЖИВАНИЕ (КУРСОР В ПИКСЕЛЯХ) =====
     private double smoothX;
     private double smoothY;
+    private double currentTargetX = 0;
+    private double currentTargetY = 0;
 
     /**
      * БАЗОВЫЙ коэффициент сглаживания. Чем выше — тем плавнее, но медленнее.
      * 0.75 = агрессивное сглаживание (было 0.55/0.6) — курсор едва заметно
      * дёргается при фиксации взгляда.
      */
-    private double smoothingFactor = 0.975; // дополнительно замедлено
+    private double smoothingFactor = 0.955;
 
     private double sensitivity = 1.0;
 
@@ -133,6 +139,8 @@ public class MouseController {
         targetY = Math.max(EDGE_MARGIN_PX, Math.min(screenSize.height - 1 - EDGE_MARGIN_PX, targetY));
 
         // EMA сглаживание
+        currentTargetX = targetX;
+        currentTargetY = targetY;
         smoothX = smoothX * smoothingFactor + targetX * (1 - smoothingFactor);
         smoothY = smoothY * smoothingFactor + targetY * (1 - smoothingFactor);
 
@@ -206,6 +214,42 @@ public class MouseController {
         robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
         try { Thread.sleep(50); } catch (InterruptedException ignored) {}
         robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+    }
+
+    public void setGlobalClickEnabled(boolean enabled) {
+        this.globalClickEnabled = enabled;
+        logger.info("Global brow-click: {}", enabled ? "ON" : "OFF");
+    }
+
+    public boolean isGlobalClickEnabled() { return globalClickEnabled; }
+
+    /**
+     * Если глобальный клик включён и пришёл brow-триггер — делаем левый клик.
+     * Вызывается из потока обработки данных (не JavaFX-поток).
+     */
+    public void processGlobalBrowClick(GazeData gazeData) {
+        if (!globalClickEnabled || robot == null || gazeData == null) return;
+        if (!gazeData.isBrowTriggerEvent()) return;
+        long now = System.currentTimeMillis();
+        if (now - lastGlobalClickMs < GLOBAL_CLICK_COOLDOWN_MS) return;
+        lastGlobalClickMs = now;
+        if (currentTargetX > 0 && currentTargetY > 0) {
+            int snapX = (int)(currentTargetX * 0.7 + smoothX * 0.3);
+            int snapY = (int)(currentTargetY * 0.7 + smoothY * 0.3);
+            robot.mouseMove(snapX, snapY);
+            smoothX = snapX;
+            smoothY = snapY;
+            logger.info("Global brow-click: snap to ({},{})", snapX, snapY);
+        } else {
+            logger.info("Global brow-click at cursor");
+        }
+        try { Thread.sleep(30); } catch (InterruptedException ignored) {}
+        performLeftClick();
+    }
+
+    public boolean wasRecentlyClicked() {
+        return globalClickEnabled &&
+                (System.currentTimeMillis() - lastGlobalClickMs) < 300;
     }
 
     public void performRightClick() {
