@@ -36,13 +36,14 @@ public class GazeEstimator {
     private int    blinkCount;
     private Point2D rawGaze;
     private GazeData lastGazeData;
-    // Адаптивный центр Y — EMA по первым 60 кадрам
-    private double adaptCenterY = 0.44;
-    private int adaptCenterYCount = 0;
 
     private int frameCount       = 0;
     private int eyesFoundCount   = 0;
     private int eyesNotFoundCount = 0;
+    private double adaptCenterY = 0.44;
+    private boolean centerYLocked = false;
+    private int centerYFrames = 0;
+    private static final int CENTER_LOCK_FRAMES = 60;
 
     // Отбраковка выбросов (Haar-режим)
     private double prevLeftX = 0, prevLeftY = 0;
@@ -171,8 +172,6 @@ public class GazeEstimator {
     public void resetFilters() {
         // Сглаживатели
         prevX = 0; prevY = 0;
-        // Сброс адаптивного центра: переоткалибруется по новым кадрам
-        adaptCenterY = 0.44; adaptCenterYCount = 0;
         // Медианный буфер
         histIdx = 0;
         // Детектор бровей — пусть тоже перекалибрует baseline под текущего пользователя
@@ -225,6 +224,29 @@ public class GazeEstimator {
         float[] iris = irisExtractor.extract(landmarks);
 
         // Среднее между двумя зрачками
+        boolean blinkingNow = (iris[4] < 0.10f) || (iris[5] < 0.10f);
+        if (blinkingNow) {
+            boolean eyesValid = false;
+            boolean trigger = browDetector.process(iris[6], iris[7], eyesValid);
+            gd.setBrowsRaised(browDetector.isActive());
+            gd.setBrowTriggerEvent(trigger);
+            if (lastGazeData != null) {
+                gd.setCombinedGaze(lastGazeData.getCombinedGaze());
+                gd.setLeftEyeGaze(lastGazeData.getLeftEyeGaze());
+                gd.setRightEyeGaze(lastGazeData.getRightEyeGaze());
+            }
+            gd.setLeftEyeClosed(true);
+            gd.setRightEyeClosed(true);
+            long nowBlink = System.currentTimeMillis();
+            if (nowBlink - lastBlinkTime > 150) {
+                blinkCount++;
+                gd.setLastBlinkTime(nowBlink);
+                lastBlinkTime = nowBlink;
+            }
+            lastGazeData = gd;
+            return gd;
+        }
+
         double rawX = (iris[0] + iris[2]) / 2.0;
         double rawY = (iris[1] + iris[3]) / 2.0;
 
@@ -232,22 +254,20 @@ public class GazeEstimator {
 // По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
 // По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
         double centerX = 0.58;
-        // Адаптивный centerY: обновляем пока не накопим 60 кадров
-        if (rawY > 0.05 && rawY < 0.95) { // игнорируем выбросы
-            if (adaptCenterYCount < 60) {
-                adaptCenterY = adaptCenterY * 0.88 + rawY * 0.12;
-                adaptCenterYCount++;
-                if (adaptCenterYCount == 60)
-                    logger.info("[GazeEst] Adaptive centerY LOCKED: {}",
-                            String.format("%.3f", adaptCenterY));
+        double rangeX  = 0.10;
+        double rangeY  = 0.065;
+
+        if (!centerYLocked) {
+            adaptCenterY = adaptCenterY * 0.88 + rawY * 0.12;
+            centerYFrames++;
+            if (centerYFrames >= CENTER_LOCK_FRAMES) {
+                centerYLocked = true;
+                logger.info("[GazeEst] Adaptive centerY LOCKED: {}", String.format("%.3f", adaptCenterY));
             }
         }
-        double centerY = adaptCenterY;
-        double rangeX  = 0.10;
-        double rangeY  = 0.065; // увеличен для компенсации наклона камеры
 
         double gazeX = (rawX - centerX) / rangeX;
-        double gazeY = (rawY - centerY) / rangeY;
+        double gazeY = (rawY - adaptCenterY) / rangeY;
 
         // Ограничение диапазона
         gazeX = Math.max(-1, Math.min(1, gazeX));

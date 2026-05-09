@@ -29,6 +29,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.ResourceBundle;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -54,10 +56,12 @@ public class MainController implements Initializable {
     @FXML private Button stopButton;
     @FXML private Button toggleMouseButton;
     @FXML private Button resetMouseButton;
+    @FXML private Button globalClickButton;  // кнопка глобального клика бровями
 
     // Gaze-hover для кнопок тулбара — подтверждение подъёмом бровей
     private Button gazeHoveredButton = null;
     private long gazeHoverStartMs = 0;
+    private long lastGazeButtonClickMs = 0;
     private static final long GAZE_HOVER_CONFIRM_MS = 1500;
 
     private final ImageView camera1View = new ImageView();
@@ -100,7 +104,6 @@ public class MainController implements Initializable {
         // Инициализация менеджеров и процессоров
         initializeComponents();
 
-        // Сразу отрисовываем клавиатуру
         if (keyboardController != null && keyboardCanvas != null) {
             keyboardController.setKeyboardVisible(true, keyboardCanvas);
         }
@@ -138,11 +141,11 @@ public class MainController implements Initializable {
 
     private void setupKeyboardCanvas() {
         // Шире и выше — нужно для полной раскладки 14 клавиш в ряду + 5 рядов
-        keyboardCanvas = new Canvas(580, 200);  // компактный размер
+        keyboardCanvas = new Canvas(580, 200);
         keyboardCanvas.setVisible(true);
+        keyboardEnabled = true;
         keyboardContainer.getChildren().add(keyboardCanvas);
         keyboardContainer.setAlignment(Pos.CENTER);
-        keyboardEnabled = true;
     }
 
     private void resetUIDisplay() {
@@ -166,7 +169,7 @@ public class MainController implements Initializable {
         mouseController = new MouseController();
         keyboardController = new KeyboardController();
         Platform.runLater(() -> {
-            if (rootPane.getScene() != null &&
+            if (rootPane != null && rootPane.getScene() != null &&
                     rootPane.getScene().getWindow() instanceof javafx.stage.Stage) {
                 keyboardController.setOwnerStage(
                         (javafx.stage.Stage) rootPane.getScene().getWindow());
@@ -199,6 +202,12 @@ public class MainController implements Initializable {
             resetMouseButton.setDisable(true);
             Tooltip.install(resetMouseButton, new Tooltip("Сначала включите управление взглядом"));
         }
+        if (globalClickButton != null) {
+            globalClickButton.setDisable(true);
+            globalClickButton.setText("🖱 Клик: ВЫКЛ");
+            Tooltip.install(globalClickButton, new Tooltip("Клик бровями по любому элементу (когда клавиатура скрыта)"));
+            globalClickButton.setOnAction(e -> toggleGlobalClick());
+        }
     }
 
     private void startCameraStatusChecker() {
@@ -216,6 +225,13 @@ public class MainController implements Initializable {
         cameraStatusChecker.start();
     }
 
+    private void toggleGlobalClick() {
+        if (mouseController == null) return;
+        boolean newState = !mouseController.isGlobalClickEnabled();
+        mouseController.setGlobalClickEnabled(newState);
+        updateButtonStates();
+        logger.info("Global brow-click toggled: {}", newState ? "ON" : "OFF");
+    }
 
     private void updateButtonStates() {
         boolean camerasRunning = cameraManager != null && cameraManager.isRunning();
@@ -243,6 +259,18 @@ public class MainController implements Initializable {
             }
             if (resetMouseButton != null) {
                 resetMouseButton.setDisable(!mouseControlEnabled.get());
+            }
+            if (globalClickButton != null) {
+                globalClickButton.setDisable(!isCalibrated || !mouseControlEnabled.get());
+                if (isCalibrated && mouseControlEnabled.get()) {
+                    boolean gc = mouseController != null && mouseController.isGlobalClickEnabled();
+                    globalClickButton.setText(gc ? "🖱 Клик: ВКЛ" : "🖱 Клик: ВЫКЛ");
+                    if (gc) {
+                        globalClickButton.setStyle("-fx-background-color: #2196F3; -fx-text-fill: white;");
+                    } else {
+                        globalClickButton.setStyle("");
+                    }
+                }
             }
         });
     }
@@ -415,12 +443,10 @@ public class MainController implements Initializable {
                     if (keyboardEnabled && keyboardController != null) {
                         final GazeData gd = gazeData;
                         final boolean skipBrow = mouseController.wasRecentlyClicked();
-                        Platform.runLater(() -> keyboardController.update(
-                                skipBrow ? null : gd));
+                        Platform.runLater(() -> keyboardController.update(skipBrow ? null : gd));
                     }
 
-                    // ГЛОБАЛЬНЫЙ КЛИК бровями (если клавиатура скрыта)
-                    // Клавиатура использует брови для клавиш — не конфликтуем
+                    // ГЛОБАЛЬНЫЙ КЛИК бровями — всегда когда мышь включена
                     if (mouseControlEnabled.get()) {
                         mouseController.processGlobalBrowClick(gazeData);
                     }
@@ -458,17 +484,16 @@ public class MainController implements Initializable {
      * Вызывается в JavaFX-потоке.
      */
     private void updateGazeButtons(Point2D calibratedGaze, GazeData gazeData) {
-        // Ищем все активные кнопки в сцене через lookup
-        java.util.List<Button> allButtons = new java.util.ArrayList<>();
+        if (calibratedGaze == null) return;
+        List<Button> allButtons = new ArrayList<>();
         try {
             if (rootPane != null && rootPane.getScene() != null) {
                 rootPane.getScene().getRoot().lookupAll(".button").forEach(node -> {
                     if (node instanceof Button) {
                         Button btn = (Button) node;
+                        // ⌨ исключена из gaze-hover
                         String bTxt = btn.getText() == null ? "" : btn.getText();
-                        // Исключаем из gaze-hover кнопки которые легко нажать случайно
-                        boolean excluded = bTxt.contains("⇄") || bTxt.contains("Режим")
-                                || bTxt.contains("⌨") || bTxt.contains("Клавиатура");
+                        boolean excluded = bTxt.contains("\u2328") || bTxt.contains("Клавиатура");
                         if (!btn.isDisable() && btn.isVisible() && !excluded) {
                             allButtons.add(btn);
                         }
@@ -477,7 +502,6 @@ public class MainController implements Initializable {
             }
         } catch (Exception ignored) {}
 
-        // Находим кнопку под курсором мыши
         java.awt.Point mousePos = java.awt.MouseInfo.getPointerInfo().getLocation();
         Button nowHovered = null;
         for (Button btn : allButtons) {
@@ -492,26 +516,39 @@ public class MainController implements Initializable {
 
         long now = System.currentTimeMillis();
 
+        // ⇄ требует 2500ms удержания взгляда
+        boolean isModeBtn = nowHovered != null &&
+                nowHovered.getText() != null && nowHovered.getText().contains("\u21c4");
+        long requiredHoldMs = isModeBtn ? 2500 : 0;
+
         if (nowHovered != gazeHoveredButton) {
-            // Сброс подсветки старой кнопки
-            if (gazeHoveredButton != null) {
-                gazeHoveredButton.setStyle("");
-            }
+            if (gazeHoveredButton != null) gazeHoveredButton.setStyle("");
             gazeHoveredButton = nowHovered;
             gazeHoverStartMs = now;
-            // Подсветить новую
-            if (gazeHoveredButton != null) {
+            if (gazeHoveredButton != null)
                 gazeHoveredButton.setStyle("-fx-background-color: rgba(33,150,243,0.25);");
-            }
         }
 
-        // Подтверждение: подъём бровей при наведённом взгляде
-        if (gazeHoveredButton != null && gazeData != null && gazeData.isBrowTriggerEvent()) {
+        // Визуальный прогресс для ⇄
+        if (isModeBtn && gazeHoveredButton != null) {
+            long held = now - gazeHoverStartMs;
+            double p = Math.min(1.0, (double) held / 2500);
+            gazeHoveredButton.setStyle(String.format(
+                    "-fx-background-color: rgba(33,150,243,%.2f); -fx-font-weight: bold;", 0.1 + 0.6 * p));
+        }
+
+        // Cooldown 1500ms между toolbar-кликами, защита от двойного срабатывания
+        // Также проверяем wasRecentlyClicked — если был snap-клик, не дублируем
+        long gazeButtonCooldown = 1500;
+        boolean recentSnap = mouseController != null && mouseController.wasRecentlyClicked();
+        if (gazeHoveredButton != null && gazeData != null && gazeData.isBrowTriggerEvent()
+                && (now - gazeHoverStartMs) >= requiredHoldMs
+                && (now - lastGazeButtonClickMs) >= gazeButtonCooldown
+                && !recentSnap) {
             Button toClick = gazeHoveredButton;
-            // Сбрасываем подсветку
             toClick.setStyle("");
             gazeHoveredButton = null;
-            // Имитируем клик
+            lastGazeButtonClickMs = now;
             toClick.fire();
             logger.info("Gaze-brow click: {}", toClick.getText());
         }
