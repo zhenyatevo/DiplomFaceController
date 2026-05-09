@@ -85,7 +85,7 @@
 
             <!-- Контейнер для клавиатуры (без растяжения по высоте) -->
             <VBox fx:id="keyboardContainer" alignment="CENTER">
-                <Label text="Виртуальная клавиатура (наведите взгляд на 0.8 сек для нажатия)" style="-fx-font-style: italic; -fx-font-size: 10;" />
+<!--                <Label text="Виртуальная клавиатура (наведите взгляд на 0.8 сек для нажатия)" style="-fx-font-style: italic; -fx-font-size: 10;" />-->
                 <!-- Canvas для клавиатуры будет добавлен программно -->
             </VBox>
 

@@ -133,7 +133,7 @@ public class CameraManager {
                         for (int test = 1; test <= 3; test++) {
                             Mat testFrame = new Mat();
                             if (cam.read(testFrame) && !testFrame.empty()) {
-                                logger.info("✅ Face camera test {}/3 passed: {}x{}",
+                                logger.info("Face camera test {}/3 passed: {}x{}",
                                         test, testFrame.width(), testFrame.height());
                                 testFrame.release();
                                 working = true;
@@ -146,7 +146,7 @@ public class CameraManager {
                         if (working) {
                             faceCamera = cam;
                             faceCameraReady.set(true);
-                            logger.info("✅ Face camera ready");
+                            logger.info("Face camera ready");
                             return;
                         }
                     }
@@ -163,7 +163,7 @@ public class CameraManager {
             }
         }
 
-        logger.error("❌ Failed to open face camera");
+        logger.error("Failed to open face camera");
     }
 
     private void openEyeCamera(int camId) {
@@ -203,12 +203,12 @@ public class CameraManager {
                         // Финальная проверка
                         Mat testFrame = new Mat();
                         if (cam.read(testFrame) && !testFrame.empty()) {
-                            logger.info("✅ Eye camera working: {}x{}", testFrame.width(), testFrame.height());
+                            logger.info("Eye camera working: {}x{}", testFrame.width(), testFrame.height());
                             testFrame.release();
 
                             eyeCamera = cam;
                             eyeCameraReady.set(true);
-                            logger.info("✅ Eye camera ready");
+                            logger.info("Eye camera ready");
                             return;
                         }
                         testFrame.release();
@@ -226,7 +226,7 @@ public class CameraManager {
             }
         }
 
-        logger.error("❌ Failed to open eye camera");
+        logger.error("Failed to open eye camera");
     }
 
     private void startCaptureThreads() {

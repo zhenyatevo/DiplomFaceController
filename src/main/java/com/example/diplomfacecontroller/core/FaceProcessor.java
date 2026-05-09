@@ -38,7 +38,7 @@ public class FaceProcessor {
 
     private void initDetectors() {
         try {
-            // ✅ Убедитесь, что OpenCV загружен ДО создания CascadeClassifier
+            // Убедитесь, что OpenCV загружен ДО создания CascadeClassifier
             org.bytedeco.javacpp.Loader.load(org.bytedeco.opencv.opencv_java.class);
 
             faceDetector = new CascadeClassifier();
@@ -206,7 +206,7 @@ public class FaceProcessor {
     }
 
     /**
-     * НОВЫЙ МЕТОД: Упрощенное вычисление поворота головы для UI
+     * Вычисление поворота головы для UI
      */
     private double[] estimateHeadPose(Rect faceRect, int frameWidth, int frameHeight) {
         double[] headPose = new double[3]; // pitch, yaw, roll
@@ -230,7 +230,7 @@ public class FaceProcessor {
     }
 
     /**
-     * Упрощенное определение выражения по области лица
+     * Определение выражения по области лица
      */
     private FaceData.Expression detectExpression(Mat faceROI, int eyeCount) {
         // Если глаз меньше 2 - возможно моргание

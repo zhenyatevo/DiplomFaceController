@@ -15,7 +15,7 @@ public class MainApplication extends Application {
 
     static {
         try {
-            // ✅ НОВОЕ: Правильная загрузка OpenCV через JavaCV
+            // Загрузка OpenCV через JavaCV
             org.bytedeco.javacpp.Loader.load(org.bytedeco.opencv.opencv_java.class);
             logger.info("OpenCV loaded successfully via JavaCV");
         } catch (Exception e) {
