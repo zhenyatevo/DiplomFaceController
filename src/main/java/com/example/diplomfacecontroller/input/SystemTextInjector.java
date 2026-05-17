@@ -116,8 +116,25 @@ public class SystemTextInjector {
     }
 
     public boolean injectEnter(WinDef.HWND target) {
-        // Многие text controls лучше реагируют на WM_CHAR с '\r' чем на VK_RETURN.
-        return injectChar('\r', target);
+        // Для подтверждения формы (поисковая строка, login и т.д.) браузеру
+        // нужен именно VK_RETURN через WM_KEYDOWN/WM_KEYUP — он навешивает
+        // обработчик на key events, а не на WM_CHAR. Шлём связкой:
+        // WM_KEYDOWN(VK_RETURN) → WM_CHAR('\r') → WM_KEYUP(VK_RETURN).
+        // Средний WM_CHAR нужен для текстовых полей (textarea), где Enter
+        // вставляет перевод строки.
+        if (target == null || user32 == null) return false;
+        try {
+            user32.PostMessage(target, WM_KEYDOWN,
+                    new WinDef.WPARAM(0x0D), new WinDef.LPARAM(1));
+            user32.PostMessage(target, WM_CHAR,
+                    new WinDef.WPARAM(0x0D), new WinDef.LPARAM(1));
+            user32.PostMessage(target, WM_KEYUP,
+                    new WinDef.WPARAM(0x0D), new WinDef.LPARAM(0xC0000001L));
+            return true;
+        } catch (Throwable t) {
+            logger.error("injectEnter failed: {}", t.getMessage());
+            return false;
+        }
     }
 
     public void injectArrow(WinDef.HWND target, int direction) {
