@@ -40,10 +40,49 @@ public class GazeEstimator {
     private int frameCount       = 0;
     private int eyesFoundCount   = 0;
     private int eyesNotFoundCount = 0;
-    private double adaptCenterY = 0.44;
-    private boolean centerYLocked = false;
-    private int centerYFrames = 0;
-    private static final int CENTER_LOCK_FRAMES = 60;
+
+    // ===== АВТОКАЛИБРОВКА ЦЕНТРА РАДУЖКИ (нейронный режим) =====
+    // Раньше центр X/Y был жёстко прописан константами, которые приходилось
+    // угадывать под конкретную камеру и посадку — и они почти никогда не
+    // совпадали с реальностью (Y улетал в насыщение ±1).
+    //
+    // Теперь первые AUTOCAL_FRAMES валидных кадров (лицо реально поймано —
+    // в отличие от старого adaptCenterY, который копил мусор с прогрева камеры)
+    // накапливаем сырые rawX/rawY и берём МЕДИАНУ как центр. После этого
+    // центр лочится. resetFilters() запускает автокалибровку заново.
+    //
+    // ВАЖНО про range: он НЕ автокалибруется, а задан фиксированно широким
+    // (см. поля rangeX/rangeY ниже). Попытка измерить range по первым кадрам
+    // проваливалась — за ~1.5 сек пользователь смотрит почти в одну точку,
+    // размах выходит ~0.03, и gaze упирается в ±1 на середине хода глаз.
+    // Широкий фиксированный range безопасен: калибровка по 9 точкам сама
+    // подгоняет наклон. По реальным логам rawX ходит в пределах ~0.08,
+    // rawY ~0.15 — берём с хорошим запасом.
+    private static final int AUTOCAL_FRAMES = 45;          // ~1.5-2 сек при 25-30 fps
+    private final java.util.List<Double> autoCalRawX = new java.util.ArrayList<>();
+    private final java.util.List<Double> autoCalRawY = new java.util.ArrayList<>();
+    private boolean autoCalDone = false;
+    private double centerX = 0.61, centerY = 0.30;   // стартовые значения до автокалибровки
+    // Широкий фиксированный диапазон — gaze почти не упирается в ±1 до калибровки.
+    private double rangeX  = 0.12, rangeY  = 0.15;
+
+    // ===== МЕДЛЕННАЯ АДАПТАЦИЯ ЦЕНТРА (защита от дрейфа головы) =====
+    // После автокалибровки центр залочен. Но за время работы пользователь
+    // понемногу смещается/оседает — "нейтраль" радужки уезжает, и gaze
+    // постепенно уходит в сторону ("теряет стабильность со временем").
+    //
+    // Решение: центр ОЧЕНЬ медленно подтягивается к текущему rawX/rawY —
+    // но ТОЛЬКО когда взгляд близко к нейтрали (|gaze| < DRIFT_NEUTRAL_ZONE).
+    // Если адаптировать при любом взгляде — центр "уплывёт за взглядом", как
+    // это делал старый сломанный adaptCenterY. Адаптация только у центра
+    // ловит именно дрейф позы, а не движение глаз.
+    private static final double DRIFT_EMA_ALPHA   = 0.0015; // скорость подтяжки
+    private static final double DRIFT_NEUTRAL_ZONE = 0.25;  // |gaze| ниже — считаем "смотрит в центр"
+
+    // Диагностика: накопленные min/max сырых координат — чтобы видеть
+    // реальный рабочий диапазон радужки в логах.
+    private double dbgMinRawX =  Double.POSITIVE_INFINITY, dbgMaxRawX = Double.NEGATIVE_INFINITY;
+    private double dbgMinRawY =  Double.POSITIVE_INFINITY, dbgMaxRawY = Double.NEGATIVE_INFINITY;
 
     // Отбраковка выбросов (Haar-режим)
     private double prevLeftX = 0, prevLeftY = 0;
@@ -157,15 +196,15 @@ public class GazeEstimator {
 
     // ================================================================
     //  СОВМЕСТИМОСТЬ С CalibrationManager
-    //  В этой версии GazeEstimator используется фиксированный центр
-    //  (centerX=0.58, centerY=0.44) внутри analyzeGazeNeural — поэтому
-    //  setCenterLocked не имеет смыслового эффекта (центр и так не двигается).
-    //  Методы оставлены чтобы CalibrationManager компилировался и его
-    //  логика "лочки центра на время калибровки" была no-op.
+    //  Центр и диапазон радужки определяются АВТОКАЛИБРОВКОЙ (первые
+    //  AUTOCAL_FRAMES валидных кадров после resetFilters), а не задаются
+    //  константами и не подвергаются постоянной EMA-адаптации. Поэтому
+    //  setCenterLocked не имеет смыслового эффекта — оставлен как no-op,
+    //  чтобы CalibrationManager компилировался без изменений.
     //
-    //  resetFilters сбрасывает медианный/EMA-сглаживатели и детектор бровей —
-    //  это полезно сделать перед калибровкой, чтобы старое состояние не
-    //  влияло на сбор точек.
+    //  resetFilters сбрасывает сглаживатели, детектор бровей И запускает
+    //  автокалибровку заново — это происходит во время warmup-фазы
+    //  калибровки, когда пользователь смотрит в центр экрана.
     // ================================================================
 
     /** Сброс фильтров перед калибровкой. */
@@ -178,7 +217,16 @@ public class GazeEstimator {
         browDetector.reset();
         // Сам raw gaze
         rawGaze = new Point2D(0, 0);
-        logger.info("GazeEstimator filters reset");
+        // Автокалибровка центра/диапазона — пересобрать заново.
+        // Это произойдёт во время warmup-фазы калибровки (пользователь смотрит
+        // в центр экрана) — идеальный момент, чтобы определить "центр" радужки.
+        autoCalDone = false;
+        autoCalRawX.clear();
+        autoCalRawY.clear();
+        // Сброс диагностического диапазона
+        dbgMinRawX =  Double.POSITIVE_INFINITY; dbgMaxRawX = Double.NEGATIVE_INFINITY;
+        dbgMinRawY =  Double.POSITIVE_INFINITY; dbgMaxRawY = Double.NEGATIVE_INFINITY;
+        logger.info("GazeEstimator filters reset (auto-cal will re-run)");
     }
 
     /**
@@ -250,24 +298,63 @@ public class GazeEstimator {
         double rawX = (iris[0] + iris[2]) / 2.0;
         double rawY = (iris[1] + iris[3]) / 2.0;
 
-        // СТАЛО — с индивидуальными диапазонами для X и Y:
-// По X радужка ходит примерно от 0.48 до 0.68 (центр ~0.58)
-// По Y радужка ходит примерно от 0.40 до 0.49 (центр ~0.44)
-        double centerX = 0.58;
-        double rangeX  = 0.10;
-        double rangeY  = 0.065;
+        // ===== ДИАГНОСТИКА: накапливаем реальный min/max сырых координат =====
+        // Это даёт точную картину рабочего диапазона радужки именно для
+        // этой камеры и посадки — больше не нужно угадывать константы.
+        if (rawX < dbgMinRawX) dbgMinRawX = rawX;
+        if (rawX > dbgMaxRawX) dbgMaxRawX = rawX;
+        if (rawY < dbgMinRawY) dbgMinRawY = rawY;
+        if (rawY > dbgMaxRawY) dbgMaxRawY = rawY;
 
-        if (!centerYLocked) {
-            adaptCenterY = adaptCenterY * 0.88 + rawY * 0.12;
-            centerYFrames++;
-            if (centerYFrames >= CENTER_LOCK_FRAMES) {
-                centerYLocked = true;
-                logger.info("[GazeEst] Adaptive centerY LOCKED: {}", String.format("%.3f", adaptCenterY));
+        // ===== АВТОКАЛИБРОВКА ТОЛЬКО ЦЕНТРА =====
+        // Первые AUTOCAL_FRAMES валидных кадров копим сырые значения и берём
+        // МЕДИАНУ как центр. Лицо здесь уже реально поймано (мы дошли до этой
+        // точки только если landmarks != null и нет моргания), поэтому мусор
+        // с прогрева не попадает — в отличие от старого adaptCenterY.
+        //
+        // ВАЖНО: range (диапазон) здесь НЕ измеряем. Раньше пробовали брать
+        // 10-90 перцентиль за первые ~1.5 сек — но за это время пользователь
+        // смотрит примерно в одну точку, и размах выходит крошечный (~0.03).
+        // Тогда gazeX/gazeY упирается в ±1 уже на середине реального хода глаз,
+        // и половина экрана становится недостижимой.
+        //
+        // Поэтому range фиксированный и заведомо ШИРОКИЙ (см. поля rangeX/rangeY).
+        // Это безопасно: калибровка по 9 точкам отлично компенсирует слишком
+        // широкий диапазон (просто коэффициент наклона будет больше). А вот
+        // слишком узкий диапазон калибровка исправить НЕ может — там сигнал
+        // уже убит насыщением в ±1.
+        if (!autoCalDone) {
+            autoCalRawX.add(rawX);
+            autoCalRawY.add(rawY);
+            if (autoCalRawX.size() >= AUTOCAL_FRAMES) {
+                double[] xs = autoCalRawX.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+                double[] ys = autoCalRawY.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+                // Центр — медиана накопленных значений.
+                centerX = xs[xs.length / 2];
+                centerY = ys[ys.length / 2];
+                // range НЕ трогаем — остаётся широким значением из полей класса.
+                autoCalDone = true;
+                autoCalRawX.clear();
+                autoCalRawY.clear();
+                logger.info("[GazeEst] AUTO-CAL done: centerX={} centerY={} rangeX={} rangeY={}",
+                        String.format("%.3f", centerX), String.format("%.3f", centerY),
+                        String.format("%.3f", rangeX),  String.format("%.3f", rangeY));
             }
         }
 
         double gazeX = (rawX - centerX) / rangeX;
-        double gazeY = (rawY - adaptCenterY) / rangeY;
+        double gazeY = (rawY - centerY) / rangeY;
+
+        // ===== МЕДЛЕННАЯ АДАПТАЦИЯ ЦЕНТРА против дрейфа головы =====
+        // Когда взгляд близко к нейтрали — потихоньку подтягиваем центр к
+        // текущему raw. Это компенсирует медленное смещение позы, но не
+        // реагирует на нормальное движение глаз по экрану (там |gaze| большой).
+        if (autoCalDone
+                && Math.abs(gazeX) < DRIFT_NEUTRAL_ZONE
+                && Math.abs(gazeY) < DRIFT_NEUTRAL_ZONE) {
+            centerX += DRIFT_EMA_ALPHA * (rawX - centerX);
+            centerY += DRIFT_EMA_ALPHA * (rawY - centerY);
+        }
 
         // Ограничение диапазона
         gazeX = Math.max(-1, Math.min(1, gazeX));
@@ -309,6 +396,13 @@ public class GazeEstimator {
             // Логируем базовую линию и текущее значение бровей — удобно для диагностики
             double browCurrent = (iris[6] + iris[7]) / 2.0;
             double browBaseline = browDetector.isBaselineReady() ? browDetector.getBaseline() : 0.0;
+            double browRatio = 1.0;
+
+            if (browBaseline > 0.0001) {
+                browRatio = browCurrent / browBaseline;
+            }
+
+            gd.setBrowRatio(browRatio);
             logger.info("[Neural] gaze=({},{}) EAR L={} R={} brow curr={} base={} ratio={}% active={} baseReady={}",
                     String.format("%.2f", gazeX), String.format("%.2f", gazeY),
                     String.format("%.2f", iris[4]), String.format("%.2f", iris[5]),
@@ -317,6 +411,17 @@ public class GazeEstimator {
                     browBaseline > 0 ? String.format("%.0f", browCurrent / browBaseline * 100) : "N/A",
                     browDetector.isActive(),
                     browDetector.isBaselineReady());
+
+            // Диагностика сырых координат — реальный рабочий диапазон радужки.
+            // По этим строкам видно, в каких пределах ходят rawX/rawY у ЭТОЙ
+            // камеры и посадки. Полезно если автокалибровка дала плохой результат.
+            logger.info("[GazeEst] raw=({},{}) rawRange X[{}..{}] Y[{}..{}] center=({},{}) range=({},{}) autoCalDone={}",
+                    String.format("%.3f", rawX), String.format("%.3f", rawY),
+                    String.format("%.3f", dbgMinRawX), String.format("%.3f", dbgMaxRawX),
+                    String.format("%.3f", dbgMinRawY), String.format("%.3f", dbgMaxRawY),
+                    String.format("%.3f", centerX), String.format("%.3f", centerY),
+                    String.format("%.3f", rangeX),  String.format("%.3f", rangeY),
+                    autoCalDone);
         }
 
         this.lastGazeData = gd;

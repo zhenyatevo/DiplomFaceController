@@ -8,6 +8,7 @@ import com.example.diplomfacecontroller.input.KeyboardController;
 import com.example.diplomfacecontroller.input.MouseController;
 import com.example.diplomfacecontroller.models.FaceData;
 import com.example.diplomfacecontroller.models.GazeData;
+import com.example.diplomfacecontroller.utils.StatsLoggerUtils;
 import javafx.application.Platform;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
@@ -76,6 +77,16 @@ public class MainController implements Initializable {
     private KeyboardController keyboardController;
     private Canvas keyboardCanvas;
     private boolean keyboardEnabled = false;
+
+    // Запомненный HWND foreground-окна, которое НЕ наше. Обновляется каждый
+    // кадр в startDataProcessingThread(). Когда пользователь переводит взгляд
+    // на нашу клавиатуру, фокус ОС всё ещё на браузере (благодаря
+    // WS_EX_NOACTIVATE). На триггер бровями отправляем символ именно в этот
+    // запомненный HWND через PostMessage(WM_CHAR).
+    private volatile com.sun.jna.platform.win32.WinDef.HWND lastTargetHwnd = null;
+    // HWND нашего собственного окна — чтобы отличать "в фокусе мы" от "в фокусе
+    // что-то полезное". Заполняется в applyNoActivate.
+    private volatile com.sun.jna.platform.win32.WinDef.HWND ownHwnd = null;
 
     // Таймер для проверки состояния камер
     private javafx.animation.AnimationTimer cameraStatusChecker;
@@ -168,13 +179,68 @@ public class MainController implements Initializable {
 
         mouseController = new MouseController();
         keyboardController = new KeyboardController();
+
+        // Печать в активное окно ОС — режим по умолчанию. Переключиться
+        // обратно во внутреннее поле можно кнопкой "Режим вывода".
+        keyboardController.setOutputMode(KeyboardController.OutputMode.SYSTEM_INJECT);
+
+        // Поставщик целевого HWND: каждый раз, когда клавиатура хочет
+        // напечатать символ, она спрашивает у нас — куда. Мы храним
+        // последний foreground HWND, который НЕ был нашим окном.
+        keyboardController.setTargetHwndSupplier(() -> lastTargetHwnd);
+
         Platform.runLater(() -> {
             if (rootPane != null && rootPane.getScene() != null &&
                     rootPane.getScene().getWindow() instanceof javafx.stage.Stage) {
-                keyboardController.setOwnerStage(
-                        (javafx.stage.Stage) rootPane.getScene().getWindow());
+
+                Stage stage = (Stage) rootPane.getScene().getWindow();
+                keyboardController.setOwnerStage(stage);
+
+                // ===== NO_ACTIVATE OVERLAY =====
+                // Окно остаётся видимым и держится поверх, но НЕ перехватывает
+                // фокус ОС при кликах и при появлении. Без этого наш JavaFX
+                // Stage в момент показа активируется, забирает caret у браузера,
+                // и инжект из KeyboardController приходит уже не туда, куда
+                // смотрел пользователь.
+                //
+                // setAlwaysOnTop(true) НЕ ставим — он на Windows форсит
+                // активацию окна при показе и отменяет эффект NO_ACTIVATE.
+                Runnable applyNoActivate = () -> {
+                    try {
+                        com.example.diplomfacecontroller.utils.WindowsFocusUtils
+                                .makeWindowNoActivate(stage);
+                        if (ownHwnd == null) {
+                            ownHwnd = com.example.diplomfacecontroller.utils
+                                    .WindowsFocusUtils.getOwnHwnd(stage);
+                        }
+                    } catch (Throwable t) {
+                        logger.warn("Failed to apply NO_ACTIVATE: {}", t.getMessage());
+                    }
+                };
+                Runnable applyAndLog = () -> {
+                    applyNoActivate.run();
+                    logger.info("NO_ACTIVATE mode enabled (ownHwnd known: {})",
+                            ownHwnd != null);
+                };
+                if (stage.isShowing()) {
+                    applyAndLog.run();
+                } else {
+                    stage.setOnShown(ev -> applyAndLog.run());
+                }
+
+                // Windows может сбросить TOPMOST, когда другое приложение
+                // становится активным (например, кликаем в браузер). Без этого
+                // наше окно «уходит под браузер», даже если NOACTIVATE применён.
+                // Подписываемся на потерю фокуса и переустанавливаем NOACTIVATE
+                // + TOPMOST без активации.
+                stage.focusedProperty().addListener((obs, was, isNow) -> {
+                    if (!isNow) {
+                        applyNoActivate.run();
+                    }
+                });
             }
         });
+
         // Подписка: когда внутренний текст клавиатуры меняется — обновляем UI label
         keyboardController.setTextChangeListener(text -> {
             if (textOutputLabel != null) textOutputLabel.setText(text);
@@ -335,6 +401,11 @@ public class MainController implements Initializable {
 
             Point2D calibratedGaze = gazeEstimator.getCalibratedGaze();
             logger.info("Calibration completed. Calibrated gaze: {}", calibratedGaze);
+            StatsLoggerUtils.event(
+                    "calib_done",
+                    calibratedGaze == null ? "null"
+                            : String.format(java.util.Locale.US, "x=%.3f,y=%.3f",
+                            calibratedGaze.getX(), calibratedGaze.getY()));
         }));
     }
 
@@ -355,6 +426,7 @@ public class MainController implements Initializable {
 
         mouseControlEnabled.set(false);
         processing.set(true);
+        StatsLoggerUtils.startSession();
 
         new Thread(() -> {
             try {
@@ -426,12 +498,31 @@ public class MainController implements Initializable {
 
             logger.info("Data processing thread started with mouse control");
 
+            long lastFrameTime = System.nanoTime();
             while (processing.get()) {
+                long frameStart = System.nanoTime();
                 try {
                     // ПОЛУЧАЕМ ОТКАЛИБРОВАННЫЙ ВЗГЛЯД
                     Point2D calibratedGaze = gazeEstimator.getCalibratedGaze();
                     GazeData gazeData = gazeEstimator.getLastGazeData();
                     FaceData faceData = faceProcessor.getLastFaceData();
+
+                    // ====== ЗАПОМИНАНИЕ ЦЕЛЕВОГО HWND ДЛЯ ВВОДА ======
+                    // Каждый кадр спрашиваем у Windows: какое окно сейчас в
+                    // foreground? Если это НЕ наше окно — запоминаем как target.
+                    // Когда пользователь наведёт взгляд на нашу клавиатуру,
+                    // наше окно всё равно не получит фокус (NOACTIVATE),
+                    // foreground останется на браузере, и lastTargetHwnd
+                    // будет указывать именно на браузер — туда уйдёт инжект.
+                    try {
+                        com.sun.jna.platform.win32.WinDef.HWND fg =
+                                com.example.diplomfacecontroller.utils
+                                        .WindowsFocusUtils.getForegroundHwnd();
+                        if (fg != null && !com.example.diplomfacecontroller.utils
+                                .WindowsFocusUtils.sameHwnd(fg, ownHwnd)) {
+                            lastTargetHwnd = fg;
+                        }
+                    } catch (Throwable ignore) {}
 
                     // УПРАВЛЕНИЕ МЫШЬЮ - если включено
                     if (mouseControlEnabled.get() && calibratedGaze != null) {
@@ -457,6 +548,28 @@ public class MainController implements Initializable {
                         final Point2D cgBtn = calibratedGaze;
                         Platform.runLater(() -> updateGazeButtons(cgBtn, gdBtn));
                     }
+
+                    // ===== МЕТРИКИ =====
+                    // Считаем FPS и frame-latency без дополнительных таймеров.
+                    boolean browTrigger = gazeData != null && gazeData.isBrowTriggerEvent();
+                    if (browTrigger) {
+                        // Дискретное событие для подсчёта общего количества
+                        // срабатываний бровей в сессии.
+                        StatsLoggerUtils.event("brow_trigger", "");
+                    }
+
+                    long now = System.nanoTime();
+                    double frameMs = (now - frameStart) / 1_000_000.0;
+                    double fps = 1_000_000_000.0 / Math.max(1, now - lastFrameTime);
+                    lastFrameTime = now;
+
+                    boolean faceDetected = faceData != null && faceData.isFaceDetected();
+                    double browRatio = gazeData != null ? gazeData.getBrowRatio() : 0.0;
+                    double gazeX = calibratedGaze != null ? calibratedGaze.getX() : 0.0;
+                    double gazeY = calibratedGaze != null ? calibratedGaze.getY() : 0.0;
+
+                    StatsLoggerUtils.log(fps, frameMs, faceDetected, browRatio,
+                            browTrigger, gazeX, gazeY);
 
                     // Обновляем UI с текущими значениями
                     updateUI(calibratedGaze, gazeData, faceData);
@@ -590,6 +703,7 @@ public class MainController implements Initializable {
 
         mouseControlEnabled.set(false);
         processing.set(false);
+        StatsLoggerUtils.stopSession();
 
         if (cameraManager != null) {
             gazeEstimator.stopNeuralMode();

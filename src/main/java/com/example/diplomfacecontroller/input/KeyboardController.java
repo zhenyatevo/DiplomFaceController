@@ -52,6 +52,19 @@ public class KeyboardController {
     private OutputMode outputMode = OutputMode.INTERNAL_FIELD;
     private final SystemTextInjector systemInjector = new SystemTextInjector();
 
+    /**
+     * Поставщик HWND целевого окна (того, куда нужно печатать).
+     * Заполняется из {@link com.example.diplomfacecontroller.MainController}:
+     * там каждый кадр запоминаем foreground HWND, когда он не равен нашему.
+     * Если supplier не выставлен или возвращает null — injectChar уйдёт на
+     * Robot-fallback (менее надёжно, но хоть что-то).
+     */
+    private java.util.function.Supplier<com.sun.jna.platform.win32.WinDef.HWND> targetHwndSupplier;
+    public void setTargetHwndSupplier(
+            java.util.function.Supplier<com.sun.jna.platform.win32.WinDef.HWND> s) {
+        this.targetHwndSupplier = s;
+    }
+
     private Stage ownerStage;
     public void setOwnerStage(Stage stage) { this.ownerStage = stage; }
 
@@ -209,32 +222,57 @@ public class KeyboardController {
 
     private boolean effectiveUpperCase() { return shiftPressed ^ capsLock; }
 
+    /** Текущий целевой HWND, или null если поставщик не настроен. */
+    private com.sun.jna.platform.win32.WinDef.HWND currentTarget() {
+        return targetHwndSupplier == null ? null : targetHwndSupplier.get();
+    }
+
     private void handleSpecial(String action) {
+        com.sun.jna.platform.win32.WinDef.HWND target = currentTarget();
         switch (action) {
             case "SHIFT": shiftPressed = !shiftPressed; break;
             case "CAPS":  capsLock = !capsLock; break;
             case "BACKSPACE":
                 if (outputMode == OutputMode.INTERNAL_FIELD) {
-                    if (internalText.length() > 0) { internalText.deleteCharAt(internalText.length()-1); notifyText(); }
-                } else { systemInjector.pressBackspace(); }
+                    if (internalText.length() > 0) {
+                        internalText.deleteCharAt(internalText.length()-1);
+                        notifyText();
+                    }
+                } else {
+                    if (!systemInjector.injectBackspace(target)) {
+                        systemInjector.pressBackspace();
+                    }
+                }
                 break;
             case "ENTER":
-                if (outputMode == OutputMode.INTERNAL_FIELD) { internalText.append('\n'); notifyText(); }
-                else { systemInjector.pressEnter(); }
+                if (outputMode == OutputMode.INTERNAL_FIELD) {
+                    internalText.append('\n');
+                    notifyText();
+                } else {
+                    if (!systemInjector.injectEnter(target)) {
+                        systemInjector.pressEnter();
+                    }
+                }
                 break;
             case "TAB":
-                if (outputMode == OutputMode.INTERNAL_FIELD) { internalText.append('\t'); notifyText(); }
-                else { systemInjector.pressTab(); }
+                if (outputMode == OutputMode.INTERNAL_FIELD) {
+                    internalText.append('\t');
+                    notifyText();
+                } else {
+                    if (!systemInjector.injectChar('\t', target)) {
+                        systemInjector.pressTab();
+                    }
+                }
                 break;
             case "SPACE": appendChar(" "); break;
             case "ESC":   if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.pressEsc(); break;
             case "CLEAR":
                 if (outputMode == OutputMode.INTERNAL_FIELD) { internalText.setLength(0); notifyText(); }
                 break;
-            case "UP":    if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.pressArrowUp();    break;
-            case "DOWN":  if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.pressArrowDown();  break;
-            case "LEFT":  if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.pressArrowLeft();  break;
-            case "RIGHT": if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.pressArrowRight(); break;
+            case "UP":    if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.injectArrow(target, 0); break;
+            case "DOWN":  if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.injectArrow(target, 1); break;
+            case "LEFT":  if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.injectArrow(target, 2); break;
+            case "RIGHT": if (outputMode == OutputMode.SYSTEM_INJECT) systemInjector.injectArrow(target, 3); break;
         }
     }
 
@@ -243,25 +281,24 @@ public class KeyboardController {
         if (outputMode == OutputMode.INTERNAL_FIELD) {
             internalText.append(ch);
             notifyText();
-        } else {
-            new Thread(() -> typeViaClipboard(ch), "KeyInject").start();
+            return;
         }
-    }
-
-    private void typeViaClipboard(String text) {
-        try {
-            Thread.sleep(80);
-            java.awt.datatransfer.StringSelection sel =
-                    new java.awt.datatransfer.StringSelection(text);
-            java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(sel, null);
-            java.awt.Robot r = new java.awt.Robot();
-            Thread.sleep(30);
-            r.keyPress(java.awt.event.KeyEvent.VK_CONTROL);
-            r.keyPress(java.awt.event.KeyEvent.VK_V);
-            r.keyRelease(java.awt.event.KeyEvent.VK_V);
-            r.keyRelease(java.awt.event.KeyEvent.VK_CONTROL);
-        } catch (Exception e) {
-            logger.error("clipboard error: {}", e.getMessage());
+        // SYSTEM_INJECT: PostMessage(WM_CHAR) сразу на запомненное HWND.
+        // Без фонового потока — PostMessage возвращается мгновенно, он
+        // только кладёт сообщение в очередь окна, не блокируется на
+        // обработке.
+        com.sun.jna.platform.win32.WinDef.HWND target = currentTarget();
+        for (int i = 0; i < ch.length(); i++) {
+            char c = ch.charAt(i);
+            boolean ok = systemInjector.injectChar(c, target);
+            logger.info("Inject char='{}' (U+{}) target={} ok={}",
+                    c, Integer.toHexString(c),
+                    target == null ? "null" : "HWND",
+                    ok);
+            // Метрика: каждое срабатывание инжекта — отдельное событие.
+            com.example.diplomfacecontroller.utils.StatsLoggerUtils.event(
+                    ok ? "key_inject_ok" : "key_inject_failed",
+                    String.valueOf(c));
         }
     }
 

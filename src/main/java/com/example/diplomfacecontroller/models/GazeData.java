@@ -19,6 +19,7 @@ public class GazeData {
      *  "опущена → поднята". Используется для дискретных действий
      *  (нажатие клавиши на клавиатуре). */
     private boolean browTriggerEvent;
+    private double browRatio;
 
     public GazeData() {
         this.leftEyeGaze = new Point2D(0, 0);
@@ -65,5 +66,13 @@ public class GazeData {
 
     public boolean isWinking() {
         return leftEyeClosed != rightEyeClosed;
+    }
+
+    public double getBrowRatio() {
+        return browRatio;
+    }
+
+    public void setBrowRatio(double browRatio) {
+        this.browRatio = browRatio;
     }
 }

@@ -4,6 +4,7 @@ import com.example.diplomfacecontroller.models.GazeData; // Добавляем �
 import org.opencv.core.Mat;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
+import com.example.diplomfacecontroller.utils.StatsLoggerUtils;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 import org.slf4j.Logger;
@@ -41,6 +42,12 @@ public class CameraManager {
     private int faceCaptureFrames = 0;
     private int eyeCaptureFrames = 0;
     private int displayFrames = 0;
+    private long statsLastTime = System.currentTimeMillis();
+    private int statsFrames = 0;
+    // ===== BROW STATS =====
+    private int browSuccessCount = 0;
+    private int browFalsePositiveCount = 0;
+    private long lastBrowTriggerTime = 0;
 
     // Ссылка на GazeEstimator для анализа кадров глаз
     private GazeEstimator gazeEstimator;
@@ -80,6 +87,7 @@ public class CameraManager {
         logger.info("========== STARTING CAMERAS ==========");
         logger.info("Face camera ID: {}, Eye camera ID: {}", faceCamId, eyeCamId);
         running = true;
+        StatsLoggerUtils.startSession();
 
         // Открываем камеры последовательно
         openFaceCamera(faceCamId);
@@ -263,12 +271,85 @@ public class CameraManager {
                 while (running && eyeCameraReady.get()) {
                     try {
                         if (eyeCamera != null && eyeCamera.read(frame) && !frame.empty()) {
+                            long frameStart = System.nanoTime();
 
                             // Камера глаз — передаём в GazeEstimator (та же камера что работала раньше)
+                            GazeData gazeData = null;
+
                             if (gazeEstimator != null) {
-                                GazeData gazeData = gazeEstimator.analyzeGaze(frame);
+                                gazeData = gazeEstimator.analyzeGaze(frame);
                                 if (eyeCaptureFrames % 30 == 0 && gazeData != null) {
                                     logger.info("Gaze data: combined={}", gazeData.getCombinedGaze());
+                                }
+                                // ===== FPS + LATENCY =====
+                                double frameMs = (System.nanoTime() - frameStart) / 1_000_000.0;
+
+                                statsFrames++;
+
+                                long now = System.currentTimeMillis();
+
+                                if (now - statsLastTime >= 1000) {
+
+                                    double fps = statsFrames * 1000.0 / (now - statsLastTime);
+
+                                    double gazeX = 0;
+                                    double gazeY = 0;
+                                    double browRatio = 0;
+                                    boolean browTrigger = false;
+                                    boolean faceDetected = gazeData != null;
+
+                                    if (gazeData != null && gazeData.getCombinedGaze() != null) {
+                                        gazeX = gazeData.getCombinedGaze().getX();
+                                        gazeY = gazeData.getCombinedGaze().getY();
+                                        browRatio = gazeData.getBrowRatio();
+                                        browTrigger = gazeData.isBrowTriggerEvent();
+                                        // ===== BROW SUCCESS TRACK =====
+                                        if (browTrigger) {
+
+                                            long t = System.currentTimeMillis();
+
+                                            // защита от спама одним trigger
+                                            if (t - lastBrowTriggerTime > 1500) {
+
+                                                browSuccessCount++;
+                                                lastBrowTriggerTime = t;
+
+                                                logger.info("[BROW] SUCCESS trigger #{}", browSuccessCount);
+                                            }
+                                        }
+                                        // ===== FALSE POSITIVE DETECTION =====
+                                        if (browTrigger && browRatio < 1.15) {
+
+                                            browFalsePositiveCount++;
+
+                                            logger.warn(
+                                                    "[BROW] FALSE POSITIVE #{} ratio={}",
+                                                    browFalsePositiveCount,
+                                                    String.format("%.2f", browRatio)
+                                            );
+                                        }
+                                    }
+
+                                    logger.info(
+                                            "[PERF] FPS={} latency={}ms gaze=({}, {})",
+                                            String.format("%.1f", fps),
+                                            String.format("%.1f", frameMs),
+                                            String.format("%.2f", gazeX),
+                                            String.format("%.2f", gazeY)
+                                    );
+
+                                    StatsLoggerUtils.log(
+                                            fps,
+                                            frameMs,
+                                            faceDetected,
+                                            browRatio,
+                                            browTrigger,
+                                            gazeX,
+                                            gazeY
+                                    );
+
+                                    statsFrames = 0;
+                                    statsLastTime = now;
                                 }
                             }
 
@@ -340,6 +421,11 @@ public class CameraManager {
                     if (now - lastFpsLog > 5000) {
                         logger.info("Face FPS: {}, Eye FPS: {}, Display: {}",
                                 faceCaptureFrames / 5, eyeCaptureFrames / 5, displayFrames / 5);
+                        logger.info(
+                                "[BROW STATS] success={} falsePositive={}",
+                                browSuccessCount,
+                                browFalsePositiveCount
+                        );
                         faceCaptureFrames = 0;
                         eyeCaptureFrames = 0;
                         displayFrames = 0;
@@ -386,6 +472,7 @@ public class CameraManager {
         faceCameraReady.set(false);
         eyeCameraReady.set(false);
 
+        StatsLoggerUtils.stopSession();
         logger.info("Cameras stopped");
     }
 

@@ -1,5 +1,7 @@
 package com.example.diplomfacecontroller.input;
 
+import com.sun.jna.platform.win32.User32;
+import com.sun.jna.platform.win32.WinDef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -8,28 +10,48 @@ import java.awt.Robot;
 import java.awt.event.KeyEvent;
 
 /**
- * Эмуляция системной клавиатуры через java.awt.Robot.
- * Используется в режиме "печатать в активное окно ОС".
+ * Эмуляция системной клавиатуры — отправка символа в чужое окно ОС.
  *
- * Все методы потокобезопасны — Robot можно дёргать из любого потока,
- * но удобнее всего вызывать из JavaFX Application Thread (там же,
- * где обрабатывается триггер по бровям).
+ * <p>Три уровня деградации:
+ * <ol>
+ *   <li><b>PostMessage(hwnd, WM_CHAR, ch, 0)</b> — основной путь. Отправляет
+ *       символ напрямую в HWND, не трогая фокус, не зависит от раскладки
+ *       клавиатуры, работает для Unicode (кириллица и т.д.). Поддерживается
+ *       всеми приложениями, которые используют стандартные text controls
+ *       (браузеры, Notepad, Word, IntelliJ, VS Code). Не работает в играх
+ *       и некоторых Electron-приложениях, которые читают raw keyboard input.</li>
+ *   <li><b>Robot + clipboard + Ctrl+V</b> — fallback. Используется только
+ *       если HWND неизвестен. Менее надёжно: зависит от активного окна
+ *       в момент keyPress и от состояния clipboard.</li>
+ * </ol>
  *
- * ВАЖНО: для корректной работы пользователь должен сначала кликнуть
- * (или вернуть фокус каким-то иным способом) в целевое окно — Notepad,
- * браузер и т.д. Окно с клавиатурой должно быть `setAlwaysOnTop(true)`,
- * но НЕ перехватывать фокус.
+ * <p>Главный публичный метод — {@link #injectChar(char, WinDef.HWND)}.
+ * Он сам выбирает путь и возвращает признак успеха.
  */
 public class SystemTextInjector {
 
     private static final Logger logger = LoggerFactory.getLogger(SystemTextInjector.class);
 
+    private static final int WM_CHAR    = 0x0102;
+    private static final int WM_KEYDOWN = 0x0100;
+    private static final int WM_KEYUP   = 0x0101;
+
+    private final User32 user32;
     private Robot robot;
 
     public SystemTextInjector() {
+        User32 u;
+        try {
+            u = User32.INSTANCE;
+        } catch (Throwable t) {
+            logger.error("JNA User32 unavailable: {}", t.getMessage());
+            u = null;
+        }
+        this.user32 = u;
+
         try {
             robot = new Robot();
-            robot.setAutoDelay(15); // мини-задержка между нажатиями для надёжности
+            robot.setAutoDelay(15);
         } catch (AWTException e) {
             logger.error("Failed to create Robot: {}", e.getMessage());
             robot = null;
@@ -37,64 +59,144 @@ public class SystemTextInjector {
     }
 
     public boolean isAvailable() {
-        return robot != null;
+        return robot != null || user32 != null;
+    }
+
+    // ============================================================
+    //                  Главный путь: PostMessage(WM_CHAR)
+    // ============================================================
+
+    /**
+     * Отправить один Unicode-символ в целевое окно через PostMessage(WM_CHAR).
+     * Не трогает фокус, не зависит от раскладки, не интерферирует с
+     * пользователем, нажимающим клавиши на физической клавиатуре.
+     *
+     * @param ch     символ (BMP, U+0000…U+FFFF)
+     * @param target HWND поля ввода или окна-контейнера; обычно тот HWND,
+     *               который был foreground до того, как пользователь
+     *               перевёл взгляд на нашу виртуальную клавиатуру
+     * @return true если PostMessage вернул успех (Windows положил в очередь)
+     */
+    public boolean injectChar(char ch, WinDef.HWND target) {
+        if (target == null) {
+            // Без target смысла нет — фокусной hwnd не запомнили. Сразу fallback.
+            return robotFallback(ch);
+        }
+        if (user32 == null) {
+            return robotFallback(ch);
+        }
+        try {
+            // Шлём WM_CHAR на целевое HWND. wParam = код символа, lParam = 1
+            // (repeat count). Windows расщепит это на правильные key events
+            // внутри клиентского цикла сообщений.
+            //
+            // NB: User32.PostMessage в JNA объявлен как void — нативный
+            // BOOL не возвращается. Считаем успехом отсутствие исключения;
+            // если HWND невалиден, Windows просто проигнорирует, символ
+            // не появится — но и крэша не будет. Видно по логу
+            // (key_inject_ok будет, а символа в окне — нет).
+            user32.PostMessage(
+                    target,
+                    WM_CHAR,
+                    new WinDef.WPARAM(ch),
+                    new WinDef.LPARAM(1));
+            return true;
+        } catch (Throwable t) {
+            logger.error("injectChar('{}') failed: {}", ch, t.getMessage());
+            return robotFallback(ch);
+        }
     }
 
     /**
-     * Печатает один символ. Для символов, требующих Shift (заглавные буквы,
-     * !@#$ и т.д.) — автоматически зажимает Shift.
+     * Backspace в целевое окно через PostMessage(WM_KEYDOWN/WM_KEYUP).
+     * Аналогично injectChar, не трогает фокус.
      */
-    public void typeChar(char ch) {
-        if (robot == null) return;
+    public boolean injectBackspace(WinDef.HWND target) {
+        return injectVK(target, 0x08); // VK_BACK
+    }
 
-        // Для печатных символов используем стратегию:
-        // - буквы a-z: VK_A..VK_Z с опциональным Shift
-        // - цифры 0-9: VK_0..VK_9 с опциональным Shift
-        // - спецсимволы: маппинг на VK + Shift
-        ShiftKey sk = mapCharToKey(ch);
-        if (sk == null) {
-            logger.warn("No mapping for char: '{}' (code={})", ch, (int) ch);
-            return;
+    public boolean injectEnter(WinDef.HWND target) {
+        // Многие text controls лучше реагируют на WM_CHAR с '\r' чем на VK_RETURN.
+        return injectChar('\r', target);
+    }
+
+    public void injectArrow(WinDef.HWND target, int direction) {
+        // direction: 0=Up, 1=Down, 2=Left, 3=Right
+        int vk;
+        switch (direction) {
+            case 0: vk = 0x26; break; // VK_UP
+            case 1: vk = 0x28; break; // VK_DOWN
+            case 2: vk = 0x25; break; // VK_LEFT
+            case 3: vk = 0x27; break; // VK_RIGHT
+            default: return;
         }
+        injectVK(target, vk);
+    }
 
+    private boolean injectVK(WinDef.HWND target, int vk) {
+        if (target == null || user32 == null) return false;
         try {
-            if (sk.shift) robot.keyPress(KeyEvent.VK_SHIFT);
-            robot.keyPress(sk.keyCode);
-            robot.keyRelease(sk.keyCode);
-            if (sk.shift) robot.keyRelease(KeyEvent.VK_SHIFT);
-        } catch (Exception e) {
-            logger.error("Error typing char '{}': {}", ch, e.getMessage());
+            // PostMessage в JNA — void; считаем успехом отсутствие исключения.
+            user32.PostMessage(target, WM_KEYDOWN,
+                    new WinDef.WPARAM(vk), new WinDef.LPARAM(1));
+            user32.PostMessage(target, WM_KEYUP,
+                    new WinDef.WPARAM(vk), new WinDef.LPARAM(0xC0000001L));
+            return true;
+        } catch (Throwable t) {
+            logger.error("injectVK({}) failed: {}", vk, t.getMessage());
+            return false;
         }
     }
 
-    /** Backspace */
-    public void pressBackspace() {
-        pressKey(KeyEvent.VK_BACK_SPACE);
+    // ============================================================
+    //                  Fallback: Robot + clipboard
+    // ============================================================
+
+    /**
+     * Если HWND неизвестен — пробуем через Robot и Ctrl+V с clipboard.
+     * Это последний рубеж, и он зависит от того, какое окно сейчас активно
+     * в Windows. Может промахнуться, если наше JavaFX-окно случайно
+     * получит фокус в момент keyPress.
+     */
+    private boolean robotFallback(char ch) {
+        if (robot == null) return false;
+        try {
+            String s = String.valueOf(ch);
+            java.awt.datatransfer.Clipboard cb =
+                    java.awt.Toolkit.getDefaultToolkit().getSystemClipboard();
+            java.awt.datatransfer.Transferable saved = null;
+            try { saved = cb.getContents(null); } catch (Throwable ignore) {}
+            cb.setContents(new java.awt.datatransfer.StringSelection(s), null);
+            Thread.sleep(15);
+            robot.keyPress(KeyEvent.VK_CONTROL);
+            robot.keyPress(KeyEvent.VK_V);
+            robot.keyRelease(KeyEvent.VK_V);
+            robot.keyRelease(KeyEvent.VK_CONTROL);
+            if (saved != null) {
+                final java.awt.datatransfer.Transferable original = saved;
+                new Thread(() -> {
+                    try { Thread.sleep(200); cb.setContents(original, null); }
+                    catch (Throwable ignore) {}
+                }, "ClipRestore").start();
+            }
+            return true;
+        } catch (Exception e) {
+            logger.error("robotFallback error: {}", e.getMessage());
+            return false;
+        }
     }
 
-    /** Enter */
-    public void pressEnter() {
-        pressKey(KeyEvent.VK_ENTER);
-    }
+    // ============================================================
+    //          Legacy API (fallback в KeyboardController)
+    // ============================================================
+    // Эти методы идут через Robot и зависят от активного окна ОС.
+    // KeyboardController использует их только когда новый inject*(target)
+    // вернул false — например, если HWND неизвестен.
 
-    /** Tab */
-    public void pressTab() {
-        pressKey(KeyEvent.VK_TAB);
-    }
-
-    /** Caps Lock — toggle */
-    public void pressCapsLock() {
-        pressKey(KeyEvent.VK_CAPS_LOCK);
-    }
-
-    public void pressArrowUp()    { pressKey(KeyEvent.VK_UP); }
-    public void pressArrowDown()  { pressKey(KeyEvent.VK_DOWN); }
-    public void pressArrowLeft()  { pressKey(KeyEvent.VK_LEFT); }
-    public void pressArrowRight() { pressKey(KeyEvent.VK_RIGHT); }
-
-    public void pressEsc()  { pressKey(KeyEvent.VK_ESCAPE); }
-    public void pressHome() { pressKey(KeyEvent.VK_HOME); }
-    public void pressEnd()  { pressKey(KeyEvent.VK_END); }
+    public void pressBackspace() { pressKey(KeyEvent.VK_BACK_SPACE); }
+    public void pressEnter()     { pressKey(KeyEvent.VK_ENTER); }
+    public void pressTab()       { pressKey(KeyEvent.VK_TAB); }
+    public void pressEsc()       { pressKey(KeyEvent.VK_ESCAPE); }
 
     private void pressKey(int keyCode) {
         if (robot == null) return;
@@ -103,64 +205,6 @@ public class SystemTextInjector {
             robot.keyRelease(keyCode);
         } catch (Exception e) {
             logger.error("Error pressing key {}: {}", keyCode, e.getMessage());
-        }
-    }
-
-    /** Внутренняя структура: VK-код + нужен ли Shift. */
-    private static class ShiftKey {
-        final int keyCode;
-        final boolean shift;
-        ShiftKey(int keyCode, boolean shift) { this.keyCode = keyCode; this.shift = shift; }
-    }
-
-    private ShiftKey mapCharToKey(char ch) {
-        // Буквы
-        if (ch >= 'a' && ch <= 'z') {
-            return new ShiftKey(KeyEvent.VK_A + (ch - 'a'), false);
-        }
-        if (ch >= 'A' && ch <= 'Z') {
-            return new ShiftKey(KeyEvent.VK_A + (ch - 'A'), true);
-        }
-        // Цифры
-        if (ch >= '0' && ch <= '9') {
-            return new ShiftKey(KeyEvent.VK_0 + (ch - '0'), false);
-        }
-        // Спецсимволы (US-раскладка)
-        switch (ch) {
-            case ' ':  return new ShiftKey(KeyEvent.VK_SPACE, false);
-            case '!':  return new ShiftKey(KeyEvent.VK_1, true);
-            case '@':  return new ShiftKey(KeyEvent.VK_2, true);
-            case '#':  return new ShiftKey(KeyEvent.VK_3, true);
-            case '$':  return new ShiftKey(KeyEvent.VK_4, true);
-            case '%':  return new ShiftKey(KeyEvent.VK_5, true);
-            case '^':  return new ShiftKey(KeyEvent.VK_6, true);
-            case '&':  return new ShiftKey(KeyEvent.VK_7, true);
-            case '*':  return new ShiftKey(KeyEvent.VK_8, true);
-            case '(':  return new ShiftKey(KeyEvent.VK_9, true);
-            case ')':  return new ShiftKey(KeyEvent.VK_0, true);
-            case '-':  return new ShiftKey(KeyEvent.VK_MINUS, false);
-            case '_':  return new ShiftKey(KeyEvent.VK_MINUS, true);
-            case '=':  return new ShiftKey(KeyEvent.VK_EQUALS, false);
-            case '+':  return new ShiftKey(KeyEvent.VK_EQUALS, true);
-            case '[':  return new ShiftKey(KeyEvent.VK_OPEN_BRACKET, false);
-            case '{':  return new ShiftKey(KeyEvent.VK_OPEN_BRACKET, true);
-            case ']':  return new ShiftKey(KeyEvent.VK_CLOSE_BRACKET, false);
-            case '}':  return new ShiftKey(KeyEvent.VK_CLOSE_BRACKET, true);
-            case '\\': return new ShiftKey(KeyEvent.VK_BACK_SLASH, false);
-            case '|':  return new ShiftKey(KeyEvent.VK_BACK_SLASH, true);
-            case ';':  return new ShiftKey(KeyEvent.VK_SEMICOLON, false);
-            case ':':  return new ShiftKey(KeyEvent.VK_SEMICOLON, true);
-            case '\'': return new ShiftKey(KeyEvent.VK_QUOTE, false);
-            case '"':  return new ShiftKey(KeyEvent.VK_QUOTE, true);
-            case ',':  return new ShiftKey(KeyEvent.VK_COMMA, false);
-            case '<':  return new ShiftKey(KeyEvent.VK_COMMA, true);
-            case '.':  return new ShiftKey(KeyEvent.VK_PERIOD, false);
-            case '>':  return new ShiftKey(KeyEvent.VK_PERIOD, true);
-            case '/':  return new ShiftKey(KeyEvent.VK_SLASH, false);
-            case '?':  return new ShiftKey(KeyEvent.VK_SLASH, true);
-            case '`':  return new ShiftKey(KeyEvent.VK_BACK_QUOTE, false);
-            case '~':  return new ShiftKey(KeyEvent.VK_BACK_QUOTE, true);
-            default:   return null;
         }
     }
 }
