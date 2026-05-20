@@ -30,19 +30,6 @@ import java.util.concurrent.atomic.AtomicLong;
  *       "session_stop".</li>
  * </ul>
  *
- * <p>Анализ в pandas:
- * <pre>{@code
- *   import pandas as pd
- *   df = pd.read_csv('stats/session_...csv')
- *   frames = df[df.kind == 'frame']
- *   events = df[df.kind == 'event']
- *   # пример: распределение brow-trigger по зонам
- *   events[events.event_type == 'brow_trigger'].detail.value_counts()
- *   # success rate inject (когда добавим в анализ)
- *   ok = (events.event_type == 'key_inject_ok').sum()
- *   fail = (events.event_type == 'key_inject_failed').sum()
- * }</pre>
- *
  * <p>Все методы thread-safe.
  */
 public class StatsLoggerUtils {

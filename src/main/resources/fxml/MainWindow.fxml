@@ -17,9 +17,9 @@
 
     <!-- Верхняя панель с заголовком и кнопками (без изменений) -->
     <top>
-        <VBox>
+        <HBox alignment="CENTER">
             <ToolBar>
-                <Label text="FaceController - Управление компьютером взглядом" style="-fx-font-size: 14; -fx-font-weight: bold;">
+                <Label text="" style="-fx-font-size: 14; -fx-font-weight: bold;">
                     <font>
                         <Font size="14.0" />
                     </font>
@@ -34,7 +34,7 @@
                 <Button text="Копировать" onAction="#copyText" />
                 <Button text="Очистить" onAction="#clearText" />
             </ToolBar>
-        </VBox>
+        </HBox>
     </top>
 
     <!-- Центральная область с видео и клавиатурой (все размеры уменьшены) -->
